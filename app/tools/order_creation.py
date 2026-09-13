@@ -1,4 +1,5 @@
 from datetime import datetime
+from app.database import log_sales_event
 
 
 def create_order(
@@ -21,6 +22,19 @@ def create_order(
     timestamp = datetime.now().strftime("%H%M%S")
 
     order_id = f"SO-DEMO-{timestamp}"
+
+    log_sales_event(
+        event_type="ORDER_CONFIRMED",
+        customer_id=customer_id,
+        amount=final_total,
+        details=order_id,
+    )
+
+    print(
+        "SALES EVENT LOGGED: ORDER_CONFIRMED",
+        order_id,
+        final_total
+    )
 
     return {
         "success": True,

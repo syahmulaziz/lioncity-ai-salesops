@@ -11,6 +11,10 @@ from app.database import (
     create_approval_request,
     get_approved_unprocessed_requests,
     mark_approval_processed,
+    reset_demo_data,
+    is_message_processed,
+    mark_message_processed,
+    log_sales_event,
 )
 
 # =========================================================
@@ -111,6 +115,9 @@ def get_customer_agent(
     """
     Get or create the persistent SalesAgent
     for a WhatsApp customer.
+
+    Creating a new agent represents the start
+    of a new sales conversation.
     """
 
     normalized_phone = normalize_phone(
@@ -128,6 +135,21 @@ def get_customer_agent(
             normalized_phone
         ] = SalesAgent(
             phone=normalized_phone
+        )
+
+        # A new in-memory SalesAgent represents
+        # one new sales conversation.
+        log_sales_event(
+            event_type="CONVERSATION_STARTED",
+            phone=normalized_phone,
+            details=(
+                "WhatsApp sales conversation started"
+            ),
+        )
+
+        print(
+            "SALES EVENT LOGGED: "
+            "CONVERSATION_STARTED"
         )
 
     return customer_agents[
@@ -377,6 +399,43 @@ async def receive_webhook(
 
         message = messages[0]
 
+        # =================================================
+        # IDEMPOTENCY CHECK
+        # =================================================
+
+        message_id = message.get("id")
+
+        if not message_id:
+
+            print(
+                "WhatsApp message has no message ID. "
+                "Ignoring."
+            )
+
+            return {
+                "status": "ignored",
+                "reason": "NO_MESSAGE_ID",
+            }
+
+
+        if is_message_processed(
+            message_id
+        ):
+
+            print("\n" + "-" * 60)
+            print("DUPLICATE WHATSAPP MESSAGE IGNORED")
+            print("-" * 60)
+
+            print(
+                "MESSAGE ID:",
+                message_id
+            )
+
+            return {
+                "status": "ignored",
+                "reason": "DUPLICATE_MESSAGE",
+                "message_id": message_id,
+            }
 
         # =================================================
         # STEP 3
@@ -448,6 +507,15 @@ async def receive_webhook(
             sender
         )
 
+        log_sales_event(
+            event_type="CUSTOMER_MESSAGE",
+            phone=normalized_phone,
+            details=customer_message,
+        )
+
+        print(
+            "SALES EVENT LOGGED: CUSTOMER_MESSAGE"
+        )
 
         print(
             "FROM:",
@@ -511,6 +579,29 @@ async def receive_webhook(
                     )
                 )
 
+                # =================================================
+                # SALESOPS — HUMAN ESCALATION
+                # =================================================
+
+                if not approval_result.get(
+                    "already_exists",
+                    False
+                ):
+
+                    log_sales_event(
+                        event_type="HUMAN_APPROVAL_REQUIRED",
+                        phone=normalized_phone,
+                        details=(
+                            f"Discount requested: "
+                            f"{requested_discount}%"
+                        ),
+                    )
+
+                    print(
+                        "SALES EVENT LOGGED: "
+                        "HUMAN_APPROVAL_REQUIRED"
+                    )
+
                 print("\n" + "-" * 60)
                 print(
                     "APPROVAL REQUEST "
@@ -561,6 +652,31 @@ async def receive_webhook(
                 recipient=sender,
                 message=reply,
             )
+        )
+
+        # =================================================
+        # MESSAGE SUCCESSFULLY PROCESSED
+        # =================================================
+        #
+        # Only mark the inbound WhatsApp message as
+        # processed after:
+        #
+        # 1. Claude completed its work
+        # 2. Business tools completed
+        # 3. The reply was successfully accepted by Meta
+        #
+        # If something fails earlier, Meta may retry and
+        # LionCity can safely process it again.
+        # =================================================
+
+        mark_message_processed(
+            message_id=message_id,
+            phone=normalized_phone,
+        )
+
+        print(
+            "MESSAGE MARKED AS PROCESSED:",
+            message_id
         )
 
 
@@ -724,6 +840,24 @@ def process_approvals():
         )
 
         # -------------------------------------------------
+        # SALESOPS — HUMAN DECISION
+        # -------------------------------------------------
+
+        log_sales_event(
+            event_type="HUMAN_APPROVAL_APPROVED",
+            phone=phone,
+            details=(
+                f"Approved discount: "
+                f"{approved_percent}%"
+            ),
+        )
+
+        print(
+            "SALES EVENT LOGGED: "
+            "HUMAN_APPROVAL_APPROVED"
+        )
+
+        # -------------------------------------------------
         # Mark decision as consumed so it isn't sent twice.
         # -------------------------------------------------
 
@@ -743,4 +877,35 @@ def process_approvals():
         "success": True,
         "processed": processed,
         "skipped": skipped,
+    }
+
+# =========================================================
+# RESET DEMO
+# =========================================================
+
+@app.post("/reset-demo")
+def reset_demo():
+    """
+    Reset the LionCity prototype to a known starting state.
+    """
+
+    print("\n" + "=" * 60)
+    print("RESETTING LIONCITY DEMO")
+    print("=" * 60)
+
+    # Clear all in-memory WhatsApp conversations.
+    customer_agents.clear()
+
+    # Restore mutable SQLite demo data.
+    result = reset_demo_data()
+
+    print("Customer conversations cleared.")
+    print("Approval queue cleared.")
+    print("Inventory restored.")
+    print("Delivery capacity restored.")
+
+    return {
+        "success": True,
+        "database": result,
+        "active_agents": len(customer_agents),
     }

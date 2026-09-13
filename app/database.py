@@ -91,16 +91,36 @@ def create_tables():
     """)
 
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS approval_requests (
-        approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        phone TEXT NOT NULL,
-        approval_type TEXT NOT NULL,
-        requested_percent REAL NOT NULL,
-        approved_percent REAL,
-        status TEXT NOT NULL DEFAULT 'PENDING',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-""")
+        CREATE TABLE IF NOT EXISTS approval_requests (
+            approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            approval_type TEXT NOT NULL,
+            requested_percent REAL NOT NULL,
+            approved_percent REAL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            message_id TEXT PRIMARY KEY,
+            phone TEXT NOT NULL,
+            processed_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sales_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            phone TEXT,
+            customer_id TEXT,
+            amount REAL,
+            details TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     connection.commit()
     connection.close()
@@ -596,6 +616,94 @@ def create_approval_request(
     phone: str,
     requested_percent: float
 ):
+    """
+    Create a human approval request.
+
+    A customer may only have one unresolved approval
+    request at a time.
+
+    Unresolved statuses:
+        PENDING
+        APPROVED
+
+    PROCESSED approvals are considered completed.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    # -------------------------------------------------
+    # Check for an existing unresolved approval.
+    # -------------------------------------------------
+
+    cursor.execute("""
+        SELECT
+            approval_id,
+            status,
+            requested_percent,
+            approved_percent
+        FROM approval_requests
+        WHERE phone = ?
+          AND status IN ('PENDING', 'APPROVED')
+        ORDER BY approval_id DESC
+        LIMIT 1
+    """, (
+        phone,
+    ))
+
+    existing = cursor.fetchone()
+
+    if existing is not None:
+
+        result = {
+            "success": True,
+            "approval_id":
+                existing["approval_id"],
+            "already_exists": True,
+            "status":
+                existing["status"],
+            "requested_percent":
+                existing["requested_percent"],
+            "approved_percent":
+                existing["approved_percent"],
+        }
+
+        connection.close()
+
+        return result
+
+    # -------------------------------------------------
+    # No unresolved request exists.
+    # Create a new one.
+    # -------------------------------------------------
+
+    cursor.execute("""
+        INSERT INTO approval_requests (
+            phone,
+            approval_type,
+            requested_percent,
+            status
+        )
+        VALUES (?, 'DISCOUNT', ?, 'PENDING')
+    """, (
+        phone,
+        requested_percent,
+    ))
+
+    approval_id = cursor.lastrowid
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "approval_id": approval_id,
+        "already_exists": False,
+        "status": "PENDING",
+        "requested_percent":
+            requested_percent,
+        "approved_percent": None,
+    }
     connection = get_connection()
     cursor = connection.cursor()
 
@@ -727,6 +835,713 @@ def mark_approval_processed(
 
     connection.commit()
     connection.close()
+
+def reset_demo_data():
+    """
+    Restore mutable LionCity prototype data
+    to the known hero-demo starting state.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    # -------------------------------------------------
+    # Clear human approval workflow.
+    # -------------------------------------------------
+
+    cursor.execute("""
+        DELETE FROM approval_requests
+    """)
+
+    # -------------------------------------------------
+    # Restore hero-demo inventory.
+    # -------------------------------------------------
+
+    inventory_values = [
+        (486, "CBL-210"),
+        (121, "ADP-120"),
+        (670, "TIE-100"),
+    ]
+
+    cursor.executemany("""
+        UPDATE inventory
+        SET available_quantity = ?
+        WHERE sku = ?
+    """, inventory_values)
+
+    # -------------------------------------------------
+    # Restore hero-demo delivery capacity.
+    # -------------------------------------------------
+
+    delivery_values = [
+        (4, "Jurong", "2026-09-15"),
+        (0, "Jurong", "2026-09-16"),
+        (2, "Woodlands", "2026-09-15"),
+    ]
+
+    cursor.executemany("""
+        UPDATE delivery_slots
+        SET remaining_capacity = ?
+        WHERE delivery_area = ?
+          AND delivery_date = ?
+    """, delivery_values)
+
+    cursor.execute("""
+        DELETE FROM processed_messages
+    """)
+
+    cursor.execute("""
+        DELETE FROM sales_events
+    """)
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "message": "Demo data reset successfully."
+    }
+
+def is_message_processed(
+    message_id: str
+):
+    """
+    Check whether a WhatsApp message has already
+    been processed by LionCity.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT message_id
+        FROM processed_messages
+        WHERE message_id = ?
+    """, (
+        message_id,
+    ))
+
+    row = cursor.fetchone()
+
+    connection.close()
+
+    return row is not None
+
+
+def mark_message_processed(
+    message_id: str,
+    phone: str
+):
+    """
+    Record a successfully processed WhatsApp message.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO processed_messages (
+            message_id,
+            phone
+        )
+        VALUES (?, ?)
+    """, (
+        message_id,
+        phone,
+    ))
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "message_id": message_id,
+    }
+
+def log_sales_event(
+    event_type: str,
+    phone: str = None,
+    customer_id: str = None,
+    amount: float = None,
+    details: str = None
+):
+    """
+    Record an observable SalesOps business event.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT INTO sales_events (
+            event_type,
+            phone,
+            customer_id,
+            amount,
+            details
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        event_type,
+        phone,
+        customer_id,
+        amount,
+        details,
+    ))
+
+    event_id = cursor.lastrowid
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "event_id": event_id,
+        "event_type": event_type,
+    }
+
+
+def get_sales_events():
+    """
+    Return SalesOps events newest first.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM sales_events
+        ORDER BY event_id DESC
+    """)
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+def get_sales_metrics():
+    """
+    Calculate live SalesOps metrics from persisted events.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+
+    # ---------------------------------------------
+    # SALES CONVERSATIONS
+    # ---------------------------------------------
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM sales_events
+        WHERE event_type = 'CONVERSATION_STARTED'
+    """)
+
+    conversations = cursor.fetchone()[0]
+
+
+    # ---------------------------------------------
+    # CUSTOMER MESSAGES
+    # ---------------------------------------------
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM sales_events
+        WHERE event_type = 'CUSTOMER_MESSAGE'
+    """)
+
+    customer_messages = cursor.fetchone()[0]
+
+
+    # ---------------------------------------------
+    # HUMAN ESCALATIONS
+    # ---------------------------------------------
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM sales_events
+        WHERE event_type = 'HUMAN_APPROVAL_REQUIRED'
+    """)
+
+    escalations = cursor.fetchone()[0]
+
+
+    # ---------------------------------------------
+    # CONFIRMED ORDERS
+    # ---------------------------------------------
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM sales_events
+        WHERE event_type = 'ORDER_CONFIRMED'
+    """)
+
+    orders = cursor.fetchone()[0]
+
+
+    # ---------------------------------------------
+    # REVENUE
+    # ---------------------------------------------
+
+    cursor.execute("""
+        SELECT COALESCE(SUM(amount), 0)
+        FROM sales_events
+        WHERE event_type = 'ORDER_CONFIRMED'
+    """)
+
+    revenue = cursor.fetchone()[0]
+
+
+    connection.close()
+
+
+    return {
+        "conversations": conversations,
+        "customer_messages": customer_messages,
+        "human_escalations": escalations,
+        "orders_confirmed": orders,
+        "revenue": float(revenue),
+    }
+
+def get_latest_sales_state():
+    """
+    Derive the current demo sales state from persisted
+    SalesOps events and approval records.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    # -------------------------------------------------
+    # Latest sales event
+    # -------------------------------------------------
+
+    cursor.execute("""
+        SELECT *
+        FROM sales_events
+        ORDER BY event_id DESC
+        LIMIT 1
+    """)
+
+    latest_event = cursor.fetchone()
+
+    # -------------------------------------------------
+    # Latest approval
+    # -------------------------------------------------
+
+    cursor.execute("""
+        SELECT *
+        FROM approval_requests
+        ORDER BY approval_id DESC
+        LIMIT 1
+    """)
+
+    latest_approval = cursor.fetchone()
+
+    connection.close()
+
+    event = (
+        dict(latest_event)
+        if latest_event
+        else None
+    )
+
+    approval = (
+        dict(latest_approval)
+        if latest_approval
+        else None
+    )
+
+    # -------------------------------------------------
+    # Nothing happening yet
+    # -------------------------------------------------
+
+    if event is None:
+
+        return {
+            "status": "READY",
+            "status_label": "Ready for WhatsApp enquiry",
+            "quote_amount": None,
+            "discount_percent": None,
+            "order_id": None,
+        }
+
+    # -------------------------------------------------
+    # Order completed
+    # -------------------------------------------------
+
+    if event["event_type"] == "ORDER_CONFIRMED":
+
+        return {
+            "status": "ORDER_CONFIRMED",
+            "status_label": "Order Confirmed",
+            "quote_amount": event["amount"],
+            "discount_percent": (
+                approval["approved_percent"]
+                if approval
+                else None
+            ),
+            "order_id": event["details"],
+        }
+
+    # -------------------------------------------------
+    # Human has approved counteroffer
+    # -------------------------------------------------
+
+    if (
+        approval
+        and approval["status"] == "PROCESSED"
+    ):
+
+        approved_percent = (
+            approval["approved_percent"]
+        )
+
+        revised_total = (
+            4700
+            * (
+                1
+                - approved_percent / 100
+            )
+            + 35
+        )
+
+        return {
+            "status": "AWAITING_CUSTOMER",
+            "status_label": "Awaiting Customer Decision",
+            "quote_amount": revised_total,
+            "discount_percent": approved_percent,
+            "order_id": None,
+        }
+
+    # -------------------------------------------------
+    # Waiting for human decision
+    # -------------------------------------------------
+
+    if (
+        approval
+        and approval["status"] in (
+            "PENDING",
+            "APPROVED",
+        )
+    ):
+
+        return {
+            "status": "HUMAN_APPROVAL",
+            "status_label": "Human Approval Required",
+            "quote_amount": 4735.0,
+            "discount_percent": None,
+            "order_id": None,
+        }
+
+    # -------------------------------------------------
+    # Normal active conversation
+    # -------------------------------------------------
+
+    return {
+        "status": "AI_HANDLING",
+        "status_label": "AI Handling Conversation",
+        "quote_amount": 4735.0,
+        "discount_percent": None,
+        "order_id": None,
+    }
+
+# =========================================================
+# CUSTOMER MANAGEMENT
+# =========================================================
+
+def add_customer(
+    customer_id: str,
+    company_name: str,
+    contact_name: str,
+    phone: str,
+    account_tier: str,
+    delivery_area: str,
+    assigned_sales_rep: str,
+):
+    """
+    Add a new customer account.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute("""
+            INSERT INTO customers (
+                customer_id,
+                company_name,
+                contact_name,
+                phone,
+                account_tier,
+                delivery_area,
+                assigned_sales_rep
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            customer_id,
+            company_name,
+            contact_name,
+            phone,
+            account_tier,
+            delivery_area,
+            assigned_sales_rep,
+        ))
+
+        connection.commit()
+
+        return {
+            "success": True,
+            "customer_id": customer_id,
+        }
+
+    except Exception as error:
+
+        connection.rollback()
+
+        return {
+            "success": False,
+            "error": str(error),
+        }
+
+    finally:
+
+        connection.close()
+
+
+def update_customer(
+    customer_id: str,
+    company_name: str,
+    contact_name: str,
+    phone: str,
+    account_tier: str,
+    delivery_area: str,
+    assigned_sales_rep: str,
+):
+    """
+    Update an existing customer account.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute("""
+            UPDATE customers
+            SET
+                company_name = ?,
+                contact_name = ?,
+                phone = ?,
+                account_tier = ?,
+                delivery_area = ?,
+                assigned_sales_rep = ?
+            WHERE customer_id = ?
+        """, (
+            company_name,
+            contact_name,
+            phone,
+            account_tier,
+            delivery_area,
+            assigned_sales_rep,
+            customer_id,
+        ))
+
+        if cursor.rowcount == 0:
+
+            connection.rollback()
+
+            return {
+                "success": False,
+                "error": "CUSTOMER_NOT_FOUND",
+            }
+
+        connection.commit()
+
+        return {
+            "success": True,
+            "customer_id": customer_id,
+        }
+
+    except Exception as error:
+
+        connection.rollback()
+
+        return {
+            "success": False,
+            "error": str(error),
+        }
+
+    finally:
+
+        connection.close()
+
+
+def remove_customer(
+    customer_id: str
+):
+    """
+    Remove a customer account.
+
+    Removal may fail if the database contains
+    dependent records protected by foreign keys.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute("""
+            DELETE FROM customers
+            WHERE customer_id = ?
+        """, (
+            customer_id,
+        ))
+
+        if cursor.rowcount == 0:
+
+            connection.rollback()
+
+            return {
+                "success": False,
+                "error": "CUSTOMER_NOT_FOUND",
+            }
+
+        connection.commit()
+
+        return {
+            "success": True,
+            "customer_id": customer_id,
+        }
+
+    except Exception as error:
+
+        connection.rollback()
+
+        return {
+            "success": False,
+            "error": str(error),
+        }
+
+    finally:
+
+        connection.close()
+
+# =========================================================
+# DELIVERY SLOT MANAGEMENT
+# =========================================================
+
+def add_delivery_slot(
+    delivery_area: str,
+    delivery_date: str,
+    delivery_fee: float,
+    remaining_capacity: int,
+):
+    """
+    Add a new delivery slot.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute("""
+            INSERT INTO delivery_slots (
+                delivery_area,
+                delivery_date,
+                delivery_fee,
+                remaining_capacity
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
+            delivery_area,
+            delivery_date,
+            delivery_fee,
+            remaining_capacity,
+        ))
+
+        connection.commit()
+
+        return {
+            "success": True,
+            "delivery_area": delivery_area,
+            "delivery_date": delivery_date,
+        }
+
+    except Exception as error:
+
+        connection.rollback()
+
+        return {
+            "success": False,
+            "error": str(error),
+        }
+
+    finally:
+
+        connection.close()
+
+
+def remove_delivery_slot(
+    delivery_area: str,
+    delivery_date: str,
+):
+    """
+    Remove an existing delivery slot.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute("""
+            DELETE FROM delivery_slots
+            WHERE delivery_area = ?
+              AND delivery_date = ?
+        """, (
+            delivery_area,
+            delivery_date,
+        ))
+
+        if cursor.rowcount == 0:
+
+            connection.rollback()
+
+            return {
+                "success": False,
+                "error": "DELIVERY_SLOT_NOT_FOUND",
+            }
+
+        connection.commit()
+
+        return {
+            "success": True,
+            "delivery_area": delivery_area,
+            "delivery_date": delivery_date,
+        }
+
+    except Exception as error:
+
+        connection.rollback()
+
+        return {
+            "success": False,
+            "error": str(error),
+        }
+
+    finally:
+
+        connection.close()
 
 if __name__ == "__main__":
     print("Database location:", DB_PATH)
