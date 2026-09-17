@@ -136,21 +136,21 @@ def seed_customers():
     customers = [
         (
             "CUST-001",
-            "Apex Engineering Pte Ltd",
+            "Cat King Pte Ltd",
             "Syahmul Aziz",
             "+6581658457",
             "GOLD",
-            "Jurong",
-            "Marcus"
+            "Tuas",
+            "Zoro"
         ),
         (
             "CUST-002",
-            "BrightWorks Services Pte Ltd",
-            "Daniel Lim",
-            "+6591112222",
+            "Family First",
+            "Dominic",
+            "+6582094108",
             "STANDARD",
-            "Woodlands",
-            "Sarah"
+            "Chua Chu Kang",
+            "Xiu Ming"
         )
     ]
 
