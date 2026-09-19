@@ -122,8 +122,110 @@ def create_tables():
         )
     """)
 
+    # HAFIZAH: ADDED COMMERCIAL_POLICIES TABLE
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS commercial_policies (
+            policy_key TEXT PRIMARY KEY,
+            policy_value REAL NOT NULL,
+            description TEXT)
+    """) 
+
     connection.commit()
     connection.close()
+
+# HAFIZAH: ADDED SEED_COMMERCIAL_POLICIES() AND GET_COMMERCIAL_POLICIES()
+def seed_commercial_policies():
+    """
+    Insert default AI commercial authority limits
+
+    Existing values are preserved so that settings changed
+    through the admin dashboard are not overwritten.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    policies = [
+        (
+            "MAX_QUANTITY_PER_SKU",
+            500,
+            "Maximum quantity per SKU the AI can approve"
+        ),(
+            "MAX_ORDER_VALUE",
+            10000,
+            "Maximum order value the AI can approve without human approval"
+        ),(
+            "MAX_DISCOUNT_PERCENT",
+            5,
+            "Maximum discount percentage the AI can approve"
+        )
+    ]
+
+    cursor.executemany("""
+        INSERT OR IGNORE INTO commercial_policies(
+            policy_key,
+            policy_value,
+            description)
+        VALUES (?, ?, ?)
+    """, policies)
+
+    connection.commit()
+    connection.close()
+
+# HAFIZAH: ADDED GET_COMMERCIAL_POLICIES()
+def get_commercial_policies():
+    """
+    Return all commercial policy settings.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT policy_key, policy_value, description
+        FROM commercial_policies
+        ORDER BY policy_key
+    """)
+
+    rows = cursor.fetchall()
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+# HAFIZAH: ADDED UPDATE_COMMERCIAL_POLICY()
+def update_commercial_policy (policy_key: str, policy_value: float):
+    """
+    Update an existing commercial policy threshold
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        UPDATE commercial_policies
+        SET policy_value = ?
+        WHERE policy_key = ?
+    """, (policy_value, policy_key))
+
+    if cursor.rowcount == 0:
+        connection.close()
+
+        return {
+            "success": False,
+            "error": "POLICY_NOT_FOUND",
+            "policy_key": policy_key
+        }
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "policy_key": policy_key,
+        "policy_value": policy_value
+    }
+
+
 
 def seed_customers():
     """
@@ -1548,6 +1650,7 @@ if __name__ == "__main__":
 
     create_tables()
 
+    seed_commercial_policies()
     seed_customers()
     seed_products()
     seed_inventory()

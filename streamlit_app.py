@@ -2,6 +2,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# HAFIZAH ADDED GET_COMMERCIAL_POLICIES AND UPDATE_COMMERCIAL_POLICY TO BE IMPORT
 from app.database import (
     get_pending_approvals,
     approve_request,
@@ -16,6 +17,8 @@ from app.database import (
     remove_customer,
     add_delivery_slot,
     remove_delivery_slot,
+    get_commercial_policies,
+    update_commercial_policy
 )
 
 
@@ -817,7 +820,7 @@ with sales_tab:
 # =========================================================
 # TAB 2 — BUSINESS DATA
 # =========================================================
-
+# HAFIZAH: ADDED POLICY TAB
 with data_tab:
 
     st.header("🗃 Business Data")
@@ -832,11 +835,13 @@ with data_tab:
         customer_tab,
         orders_tab,
         delivery_tab,
+        policy_tab,
     ) = st.tabs([
         "📦 Inventory",
         "👥 Customers",
         "🧾 Orders",
         "🚚 Delivery",
+        "🛡️ AI Authority",
     ])
 
 
@@ -1840,6 +1845,127 @@ with delivery_tab:
                         f"Could not remove delivery slot: "
                         f"{result['error']}"
                     )
+# HAFIZAH: ADDED AI COMMERCIAL AUTHORITY
+# =========================================================
+# AI COMMERCIAL AUTHORITY
+# =========================================================
+
+with policy_tab:
+    st.subheader("🛡️ AI Commercial Authority")
+    st.caption(
+        "Configure the commercial limits that the AI Sales "
+        "Agent may approve without human intervention."
+    )
+    policies = get_commercial_policies()
+
+    policy_lookup = {
+        policy["policy_key"]: policy
+        for policy in policies
+    }
+
+    max_quantity= float(policy_lookup["MAX_QUANTITY_PER_SKU"]["policy_value"])
+
+    max_order_value = float(policy_lookup["MAX_ORDER_VALUE"]["policy_value"])
+
+    max_discount = float(policy_lookup["MAX_DISCOUNT_PERCENT"]["policy_value"])
+
+    st.info(
+        "Transactions exceeding any of these limits "
+        "require human approval."
+    )
+
+    st.markdown("#### Current Authority Limits")
+
+    quantity_col, value_col, discount_col = st.columns(3)
+
+    with quantity_col:
+        st.metric(
+            "Maximum Quantity / SKU",
+            f"{max_quantity:,.0f}"
+        )
+
+    with value_col:
+        st.metric(
+            "Maximum Order Value",
+            f"S${max_order_value:,.2f}"
+        )
+
+    with discount_col:
+        st.metric(
+            "Maximum Discount",
+            f"{max_discount:.1f}"
+        )
+
+    st.divider()
+
+    st.markdown("#### Update Authority Limits")
+
+    new_max_quantity = st.number_input(
+        "Maximum Quantity per SKU",
+        min_value=1,
+        value=int(max_quantity),
+        step=1,
+        help=(
+            "Orders above this quantity require "
+            "human approval."
+        ),
+    )
+
+    new_max_order_value = st.number_input(
+        "Maximum Order Value (S$)",
+        min_value=0.0,
+        value=max_order_value,
+        step=500.0,
+        help=(
+            "Orders above this value require "
+            "human approval."
+        )
+    )
+
+    new_max_discount = st.number_input(
+        "Maximum Discount (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=max_discount,
+        step=1.0,
+        help=(
+            "Discounts above this percentage require "
+            "human approval."
+        ),
+    )
+
+    if st.button(
+        "Save Authority Limits",
+        type="primary",
+        use_container_width=True,
+        key="save_commercial_authority"
+    ):
+        results = [
+            update_commercial_policy(
+                "MAX_QUANTITY_PER_SKU",
+                float(new_max_quantity),
+            ),
+            update_commercial_policy(
+                "MAX_ORDER_VALUE",
+                float(new_max_order_value),
+            ),
+            update_commercial_policy(
+                "MAX_DISCOUNT_PERCENT",
+                float(new_max_discount),
+            ),
+        ]
+
+        if all(result["success"] for result in results):
+            st.success(
+                "AI commercial authority updated successfully."
+            )
+            st.rerun()
+
+        else:
+            st.error(
+                "One or more commercial authority "
+                "settings could not be updated."
+            )
 
 # =========================================================
 # TAB 3 — SALESOPS
