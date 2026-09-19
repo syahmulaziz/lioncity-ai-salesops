@@ -13,6 +13,10 @@ from app.tools.discount import check_discount_authority
 from app.tools.commercial_policy import evaluate_commercial_authority
 from app.database import create_approval_request
 from app.tools.order_creation import create_order
+from app.database import (
+    get_matching_commercial_approval,
+    mark_approval_processed,
+)
 
 
 MODEL_NAME = "claude-sonnet-4-5"
@@ -29,6 +33,10 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "phone": {
+                    "type": "string",
+                    "description": "Customer WhatsApp phone number"
+                },
                 "customer_id": {
                     "type": "string"
                 },
@@ -74,6 +82,7 @@ TOOLS = [
                 }
             },
             "required": [
+                "phone",
                 "customer_id",
                 "items",
                 "product_subtotal",
@@ -513,9 +522,50 @@ def execute_tool(tool_name: str, tool_input: dict):
 
         return authority_result
 
+    # HAFIZAH: ENFORCE COMMERCIAL AUTHORITY
+    # BEFORE CREATING AN ORDER
     if tool_name == "create_order":
 
-        return create_order(
+        matched_approvals = []
+
+        for item in tool_input["items"]:
+            authority_result = evaluate_commercial_authority(
+                item["sku"],
+                item["quantity"],
+                tool_input["product_subtotal"],
+                tool_input["discount_percent"]
+            )
+
+            if not authority_result.get("success"):
+                return authority_result
+
+            if authority_result.get("requires_human_approval"):
+                approval = get_matching_commercial_approval(
+                    phone=tool_input["phone"],
+                    sku=item["sku"],
+                    requested_quantity=item["quantity"],
+                    order_value=tool_input["product_subtotal"],
+                    discount_percent=tool_input["discount_percent"],
+                )
+
+                if approval is None:
+                    return {
+                        "success": False,
+                        "error": "HUMAN_APPROVAL_REQUIRED",
+                        "message": (
+                            "This transaction requires "
+                            "human approval before the "
+                            "order can be created."
+                        ),
+                        "reasons": authority_result.get(
+                            "reasons",
+                            []
+                        ),
+                    }
+
+                matched_approvals.append(approval)
+
+        order_result = create_order(
             customer_id=tool_input["customer_id"],
             items=tool_input["items"],
             product_subtotal=tool_input["product_subtotal"],
@@ -525,6 +575,14 @@ def execute_tool(tool_name: str, tool_input: dict):
             delivery_area=tool_input["delivery_area"],
             delivery_date=tool_input["delivery_date"]
         )
+
+        if order_result.get("success"):
+
+            for approval in matched_approvals:
+
+                mark_approval_processed(approval["approval_id"])
+
+        return order_result
 
     return {
         "success": False,

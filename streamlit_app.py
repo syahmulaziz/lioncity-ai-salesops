@@ -601,6 +601,13 @@ with sales_tab:
 
             for request in pending_requests:
 
+                # HAFIZAH: DISTINGUISH COMMERCIAL AUTHORITY
+                # APPROVALS FROM LEGACY DISCOUNT APPROVALS
+                approval_type = request.get(
+                    "approval_type",
+                    "DISCOUNT"
+                )
+
                 with st.container(
                     border=True
                 ):
@@ -609,9 +616,10 @@ with sales_tab:
                         "🔥 APPROVAL REQUIRED"
                     )
 
-                    st.markdown(
-                        "### Discount Request"
-                    )
+                    if approval_type == "COMMERCIAL_AUTHORITY":
+                        st.markdown("### Commercial Authority Request")
+                    else:
+                        st.markdown("### Discount Request")
 
                     st.write(
                         "**Company:** "
@@ -623,6 +631,96 @@ with sales_tab:
                         f"{request['phone']}"
                     )
 
+                    # HAFIZAH: SHOW COMMERCIAL AUTHORITY DETAILS
+                    if approval_type == "COMMERCIAL_AUTHORITY":
+
+                        st.write(
+                            "**SKU:** "
+                            f"{request.get('sku') or 'N/A'}"
+                        )
+
+                        st.write(
+                            "**Requested Quantity:** "
+                            f"{request.get('requested_quantity') or 0:,}"
+                        )
+
+                        st.write(
+                            "**Order Value:** "
+                            f"S${(request.get('order_value') or 0):,.2f}"
+                        )
+
+                        st.write(
+                            "**Requested Discount:** "
+                            f"{(request.get('requested_percent') or 0):.0f}%"
+                        )
+
+                        reason_labels = {
+                            "HIGH_QUANTITY": "Quantity exceeds AI authority",
+                            "HIGH_VALUE": "Order value exceeds AI authority",
+                            "EXCESSIVE_DISCOUNT": "Discount exceeds AI authority",
+                        }
+
+                        reasons = [
+                            reason.strip()
+                            for reason in (
+                                request.get("reason") or ""
+                            ).split(",")
+                            if reason.strip()
+                        ]
+
+                        if reasons:
+
+                            st.write("**Escalation Reasons:**")
+
+                            for reason in reasons:
+                                st.write(
+                                    f"- {reason_labels.get(reason, reason)}"
+                                )
+
+                    # HAFIZAH: COMMERCIAL AUTHORITY HUMAN DECISION
+                    if approval_type == "COMMERCIAL_AUTHORITY":
+
+                        st.warning(
+                            "This transaction exceeds one or more "
+                            "configured AI commercial authority limits "
+                            "and requires human approval."
+                        )
+
+                        if st.button(
+                            "✓ Approve Commercial Transaction",
+                            type="primary",
+                            use_container_width=True,
+                            key=(
+                                f"approve_commercial_"
+                                f"{request['approval_id']}"
+                            ),
+                        ):
+
+                            result = approve_request(
+                                approval_id=request["approval_id"],
+                                approved_percent=(
+                                    request.get("requested_percent") or 0
+                                ),
+                            )
+
+                            if result["success"]:
+
+                                st.success("✓ Commercial transaction approved.")
+
+                                st.rerun()
+
+                            else:
+
+                                st.error(
+                                    "Commercial approval could not "
+                                    "be recorded."
+                                )
+
+                    # Commercial authority requests use the
+                    # dedicated approval UI above.
+                    # Do not render the legacy discount controls.
+                    if approval_type == "COMMERCIAL_AUTHORITY":
+                        continue
 
                     requested_col, authority_col = (
                         st.columns(2)

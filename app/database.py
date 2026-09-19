@@ -935,6 +935,46 @@ def get_approved_unprocessed_requests():
 
     return [dict(row) for row in rows]
 
+# HAFIZAH: FIND MATCHING COMMERCIAL AUTHORITY APPROVAL
+def get_matching_commercial_approval(
+    phone: str,
+    sku: str,
+    requested_quantity: int,
+    order_value: float,
+    discount_percent: float,
+):
+    """
+    Return an approved commercial-authority request
+    matching the proposed transaction.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM approval_requests
+        WHERE phone = ?
+          AND approval_type = 'COMMERCIAL_AUTHORITY'
+          AND status = 'APPROVED'
+          AND sku = ?
+          AND requested_quantity = ?
+          AND ABS(order_value - ?) < 0.01
+          AND ABS(approved_percent - ?) < 0.01
+        ORDER BY approval_id DESC
+        LIMIT 1
+    """, (
+        phone,
+        sku,
+        requested_quantity,
+        order_value,
+        discount_percent,
+    ))
+
+    row = cursor.fetchone()
+    connection.close()
+
+    return dict(row) if row else None
 
 def mark_approval_processed(
     approval_id: int
