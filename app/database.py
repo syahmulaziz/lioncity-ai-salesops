@@ -116,6 +116,7 @@ def create_tables():
     )
     """)
 
+    # HAFIZAH: ADDED sku, requested_quantity, order_value and reason
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS approval_requests (
             approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,7 +125,11 @@ def create_tables():
             requested_percent REAL NOT NULL,
             approved_percent REAL,
             status TEXT NOT NULL DEFAULT 'PENDING',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            sku TEXT,
+            requested_quantity INTEGER,
+            order_value REAL,
+            reason TEXT
         )
     """)
 
@@ -740,12 +745,22 @@ def update_delivery_capacity(
             remaining_capacity
     }
 
+# HAFIZAH: REPLACED CREATE_APPROVAL_REQUEST TO
+# SUPPORT SKU, REQUESTED_QUANTITY, ORDER_VALUE AND REASON
 def create_approval_request(
     phone: str,
-    requested_percent: float
+    requested_percent: float = 0,
+    approval_type: str = "DISCOUNT",
+    sku: str = None,
+    requested_quantity: int = None,
+    order_value: float = None,
+    reason: str = None,
 ):
     """
     Create a human approval request.
+
+    Supports discount approvals and commercial authority
+    escalations such as high quantity and high order value.
 
     A customer may only have one unresolved approval
     request at a time.
@@ -768,8 +783,13 @@ def create_approval_request(
         SELECT
             approval_id,
             status,
+            approval_type,
             requested_percent,
-            approved_percent
+            approved_percent,
+            sku,
+            requested_quantity,
+            order_value,
+            reason
         FROM approval_requests
         WHERE phone = ?
           AND status IN ('PENDING', 'APPROVED')
@@ -785,15 +805,16 @@ def create_approval_request(
 
         result = {
             "success": True,
-            "approval_id":
-                existing["approval_id"],
+            "approval_id": existing["approval_id"],
             "already_exists": True,
-            "status":
-                existing["status"],
-            "requested_percent":
-                existing["requested_percent"],
-            "approved_percent":
-                existing["approved_percent"],
+            "status": existing["status"],
+            "approval_type": existing["approval_type"],
+            "requested_percent": existing["requested_percent"],
+            "approved_percent": existing["approved_percent"],
+            "sku": existing["sku"],
+            "requested_quantity": existing["requested_quantity"],
+            "order_value": existing["order_value"],
+            "reason": existing["reason"],
         }
 
         connection.close()
@@ -810,12 +831,21 @@ def create_approval_request(
             phone,
             approval_type,
             requested_percent,
-            status
+            status,
+            sku,
+            requested_quantity,
+            order_value,
+            reason
         )
-        VALUES (?, 'DISCOUNT', ?, 'PENDING')
+        VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?)
     """, (
         phone,
+        approval_type,
         requested_percent,
+        sku,
+        requested_quantity,
+        order_value,
+        reason,
     ))
 
     approval_id = cursor.lastrowid
@@ -828,56 +858,13 @@ def create_approval_request(
         "approval_id": approval_id,
         "already_exists": False,
         "status": "PENDING",
-        "requested_percent":
-            requested_percent,
+        "approval_type": approval_type,
+        "requested_percent": requested_percent,
         "approved_percent": None,
-    }
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    # Avoid duplicate pending requests.
-    cursor.execute("""
-        SELECT approval_id
-        FROM approval_requests
-        WHERE phone = ?
-          AND status = 'PENDING'
-        ORDER BY approval_id DESC
-        LIMIT 1
-    """, (phone,))
-
-    existing = cursor.fetchone()
-
-    if existing is not None:
-        connection.close()
-
-        return {
-            "success": True,
-            "approval_id": existing["approval_id"],
-            "already_exists": True
-        }
-
-    cursor.execute("""
-        INSERT INTO approval_requests (
-            phone,
-            approval_type,
-            requested_percent,
-            status
-        )
-        VALUES (?, 'DISCOUNT', ?, 'PENDING')
-    """, (
-        phone,
-        requested_percent
-    ))
-
-    approval_id = cursor.lastrowid
-
-    connection.commit()
-    connection.close()
-
-    return {
-        "success": True,
-        "approval_id": approval_id,
-        "already_exists": False
+        "sku": sku,
+        "requested_quantity": requested_quantity,
+        "order_value": order_value,
+        "reason": reason,
     }
 
 

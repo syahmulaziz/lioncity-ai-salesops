@@ -112,7 +112,7 @@ def evaluate_commercial_authority(
 
     return {
         "success": True,
-        "reqires_human_approval": requires_human_approval,
+        "requires_human_approval": requires_human_approval,
         "reasons": reasons,
         "checks": {
             "quantity": quantity_result,

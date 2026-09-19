@@ -11,6 +11,7 @@ from app.tools.delivery import check_delivery
 from app.tools.date_tools import resolve_date
 from app.tools.discount import check_discount_authority
 from app.tools.commercial_policy import evaluate_commercial_authority
+from app.database import create_approval_request
 from app.tools.order_creation import create_order
 
 
@@ -275,6 +276,10 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "phone": {
+                    "type": "string",
+                    "description": "Customer WhatsApp phone number"
+                },
                 "sku": {
                     "type": "string"
                 },
@@ -289,6 +294,7 @@ TOOLS = [
                 }
             },
             "required": [
+                "phone",
                 "sku",
                 "quantity",
                 "order_value",
@@ -482,12 +488,30 @@ def execute_tool(tool_name: str, tool_input: dict):
 
     # HAFIZAH: ADDED TOOL FOR EVALUATE_COMMERCIAL_AUTHORITY
     if tool_name == "evaluate_commercial_authority":
-        return evaluate_commercial_authority(
-            tool_input["sku"],
-            tool_input["quantity"],
-            tool_input["order_value"],
-            tool_input["discount_percent"]
+        authority_result = evaluate_commercial_authority(
+        tool_input["sku"],
+        tool_input["quantity"],
+        tool_input["order_value"],
+        tool_input["discount_percent"]
         )
+
+        if (
+            authority_result.get("success")
+            and authority_result.get("requires_human_approval")
+        ):
+            approval_result = create_approval_request(
+                phone=tool_input["phone"],
+                requested_percent=tool_input["discount_percent"],
+                approval_type="COMMERCIAL_AUTHORITY",
+                sku=tool_input["sku"],
+                requested_quantity=tool_input["quantity"],
+                order_value=tool_input["order_value"],
+                reason=",".join(authority_result.get("reasons", []))
+            )
+
+            authority_result["approval"] = approval_result
+
+        return authority_result
 
     if tool_name == "create_order":
 
