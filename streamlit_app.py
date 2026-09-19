@@ -37,7 +37,7 @@ st.set_page_config(
 st.title("🤖 LionCity AI SalesOps")
 
 st.caption(
-    'From "bro, same order" to confirmed order.'
+    'From "bro, same order" to confirmed order. • AWS Staging'
 )
 
 
