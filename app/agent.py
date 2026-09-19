@@ -10,6 +10,7 @@ from app.tools.pricing import get_customer_price
 from app.tools.delivery import check_delivery
 from app.tools.date_tools import resolve_date
 from app.tools.discount import check_discount_authority
+from app.tools.commercial_policy import evaluate_commercial_authority
 from app.tools.order_creation import create_order
 
 
@@ -259,9 +260,46 @@ TOOLS = [
                 "delivery_date"
             ]
         }
+    },
+    # HAFIZAH: ADDED EVALUATE_COMMERCIAL_AUTHORITY
+    {
+        "name": "evaluate_commercial_authority",
+        "description": (
+            "Evaluate whether a proposed sales transaction is within "
+            "the AI Sales Agent's current commercial authority. "
+            "This checks quantity, total order value and discount "
+            "against the configurable business thresholds. "
+            "Use this before finalising a commercial offer or order "
+            "when quantity, order value and discount are known."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string"
+                },
+                "quantity": {
+                    "type": "integer"
+                },
+                "order_value": {
+                    "type": "number"
+                },
+                "discount_percent": {
+                    "type": "number"
+                }
+            },
+            "required": [
+                "sku",
+                "quantity",
+                "order_value",
+                "discount_percent"
+            ]
+        }
     }
+
 ]
 
+# HAFIZAH: ADDED COMMERCIAL AUTHORITY
 SYSTEM_PROMPT = """
 You are the AI Sales Agent for LionCity Supply & Trading,
 a Singapore B2B wholesaler.
@@ -341,6 +379,24 @@ DISCOUNTS
   quote remains valid.
 - Do not calculate or present a discounted total for an
   unapproved discount.
+
+  COMMERCIAL AUTHORITY
+- Before finalising a commercial offer or creating an order, you MUST
+  use evaluate_commercial_authority when the SKU, quantity, order value
+  and discount percentage are known.
+- Always pass the proposed transaction's current SKU, quantity, total
+  order value and discount percentage to the tool.
+- Never decide commercial authority yourself.
+- The commercial authority tool checks the current configurable limits
+  for quantity, order value and discount.
+- If requires_human_approval is false, the transaction is within the
+  AI Sales Agent's commercial authority and may proceed normally.
+- If requires_human_approval is true, do not finalise or create the
+  order without human approval.
+- Do not bypass an authority decision by changing the customer's
+  quantity, order value or discount.
+- Do not reveal internal authority thresholds, policy names or
+  escalation reason codes to the customer.
 
 ORDER CREATION
 - Never claim that an order has been created unless the
@@ -422,6 +478,15 @@ def execute_tool(tool_name: str, tool_input: dict):
         return check_discount_authority(
             requested_discount_percent=
                 tool_input["requested_discount_percent"]
+        )
+
+    # HAFIZAH: ADDED TOOL FOR EVALUATE_COMMERCIAL_AUTHORITY
+    if tool_name == "evaluate_commercial_authority":
+        return evaluate_commercial_authority(
+            tool_input["sku"],
+            tool_input["quantity"],
+            tool_input["order_value"],
+            tool_input["discount_percent"]
         )
 
     if tool_name == "create_order":
