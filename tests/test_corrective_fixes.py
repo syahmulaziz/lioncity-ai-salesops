@@ -241,7 +241,7 @@ def test_large_value_rule_reachable_end_to_end(monkeypatch):
     # between the pre-pricing and post-pricing states.
     script = [
         # send 1: identify existing STANDARD customer + capture business/qty.
-        [("find_customer", {"phone": "+6591112222"}),        # CUST-002 STANDARD
+        [("find_customer", {"phone": "+6582094108"}),        # CUST-002 STANDARD
          ("update_enquiry_signals", {"business_customer": True, "quantity": 20})],
         "Let me price that for you.",
         # send 2: trusted pricing returns subtotal 6000 (>=5000).
@@ -249,7 +249,7 @@ def test_large_value_rule_reachable_end_to_end(monkeypatch):
                                  "quantity": 20})],
         "Here are the details.",
     ]
-    agent, tools = build_agent(monkeypatch, script, phone="+6591112222")
+    agent, tools = build_agent(monkeypatch, script, phone="+6582094108")
 
     agent.send("Hi, business customer, 20 units.")
     t_before = agent.last_triage

@@ -14,6 +14,10 @@ import sys
 import types
 
 # --- Offline stubs for packages not installed in the sandbox. ---
+# app.agent -> app.claude_client imports these third-party packages at module
+# load. They are not installed in this offline sandbox and these tests never
+# make a real LLM/HTTP call, so we register minimal stubs BEFORE importing
+# app.agent. This is TEST-ONLY scaffolding; no application code is modified.
 if "anthropic" not in sys.modules:
     _a = types.ModuleType("anthropic")
     _a.Anthropic = object
@@ -22,6 +26,25 @@ if "dotenv" not in sys.modules:
     _d = types.ModuleType("dotenv")
     _d.load_dotenv = lambda *a, **k: False
     sys.modules["dotenv"] = _d
+if "requests" not in sys.modules:
+    # Staging's new LLM gateway client (app/claude_client.py) imports
+    # `requests` at module load. Stub it so the module imports offline; the
+    # scripted mock client is used instead of any real HTTP client.
+    _r = types.ModuleType("requests")
+
+    def _no_http(*args, **kwargs):  # pragma: no cover - defensive
+        raise AssertionError("Live HTTP call attempted in an offline test")
+
+    _r.get = _no_http
+    _r.post = _no_http
+    _r.request = _no_http
+
+    class _RequestException(Exception):
+        pass
+
+    _r.RequestException = _RequestException
+    _r.exceptions = types.SimpleNamespace(RequestException=_RequestException)
+    sys.modules["requests"] = _r
 
 from app import agent as agent_module  # noqa: E402
 from app.agent import SalesAgent  # noqa: E402

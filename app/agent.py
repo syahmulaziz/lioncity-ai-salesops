@@ -15,7 +15,6 @@ from app.tools.order_creation import create_order
 # Person 1 sales-triage enhancement (structured enquiry state + triage).
 from app.enquiry_state import EnquiryState
 from app import triage
-from app.triage_config import BAND_HIGH_PRIORITY
 from app.tools.faq import lookup_faq
 from app.tools.products import find_product, STATUS_UNIQUE_MATCH as PRODUCT_UNIQUE_MATCH
 from app.handoff import record_handoff
@@ -582,11 +581,10 @@ SPEAKING TO A PERSON
 - If the customer explicitly asks to speak to a person or salesperson,
   use request_human_handoff. Do not create an order for that request.
   Confirm briefly that you've flagged it for the sales team.
-- Some enquiries are automatically referred to the sales team by the
-  business system. When that happens, let the customer know their
-  enquiry has been referred to our sales team who will follow up.
-  Do NOT claim a salesperson has already reviewed, accepted, or
-  processed it - only that it has been referred.
+- Do NOT refer an enquiry to a human just because it seems commercially
+  important or high priority. Continue helping the customer yourself
+  unless they explicitly ask for a person, or a separate business rule
+  (such as a discount beyond your approval authority) requires it.
 
 QUOTATIONS
 - When the customer asks for a quotation, use
@@ -725,12 +723,6 @@ class SalesAgent:
         # Latest deterministic triage result (Category C). Set only by the
         # application via triage.evaluate(); never calculated by the LLM.
         self.last_triage = None
-
-        # Idempotency flag for the automatic HIGH_PRIORITY sales handoff.
-        # Once this enquiry has triggered its automatic handoff, later
-        # re-evaluations must NOT create duplicate HUMAN_HANDOFF_REQUESTED
-        # events. (Explicit customer handoff requests are separate.)
-        self._auto_handoff_done = False
 
         # Useful later for our Streamlit activity panel.
         self.activity_log = []
@@ -917,13 +909,21 @@ class SalesAgent:
         reads current state, corrections (e.g. quantity 100 -> 5) naturally
         drop the points they no longer justify.
 
-        SIDE-EFFECT POLICY (revised business requirement):
-        - HIGH_PRIORITY now automatically triggers ONE human sales handoff
-          (idempotent - see below). This is the ONLY automatic side effect.
-        - It still NEVER creates an order, approves a discount, changes
-          delivery, or sends an extra message from here.
-        The deterministic scoring in triage.py remains pure; only this
-        orchestration layer acts on the resulting band.
+        SALES PRIORITY vs HITL (decoupled):
+        - The priority band (ROUTINE / SALES_OPPORTUNITY / HIGH_PRIORITY) is
+          SALES PRIORITY ONLY - "how commercially important is this enquiry?".
+        - It does NOT decide whether a human must intervene. In particular,
+          HIGH_PRIORITY does NOT create a handoff, an approval, or an order.
+        - Human intervention is a SEPARATE concern owned by commercial-HITL
+          policy: discount above AI authority (existing teammate approval
+          workflow) and an explicit customer request for a person
+          (request_human_handoff). High-value / high-quantity HITL policies
+          are recognised business categories but their numeric thresholds are
+          not yet defined in the repository, so no HITL is triggered from them
+          here.
+        This method therefore has NO automatic side effect beyond computing,
+        storing and logging the (internal) triage result. The deterministic
+        scoring in triage.py remains pure.
         """
         result = triage.evaluate(self.enquiry)
         self.last_triage = result
@@ -940,19 +940,6 @@ class SalesAgent:
                 "priority_reasons": result.priority_reasons,
             },
         )
-
-        # Automatic HIGH_PRIORITY -> human sales handoff, exactly once per
-        # enquiry (idempotent via self._auto_handoff_done). Subsequent
-        # re-evaluations that remain HIGH_PRIORITY do NOT create duplicates.
-        if (
-            result.priority_band == BAND_HIGH_PRIORITY
-            and not self._auto_handoff_done
-        ):
-            self._auto_handoff_done = True
-            self._create_handoff(
-                trigger="high_priority",
-                reason="enquiry auto-referred to sales (HIGH_PRIORITY)",
-            )
 
         return result
 

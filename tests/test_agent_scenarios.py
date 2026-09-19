@@ -82,12 +82,12 @@ def test_scenario_b_routine_product_enquiry(monkeypatch):
 
 def test_scenario_c_sales_opportunity(monkeypatch):
     script = [
-        [("find_customer", {"phone": "+6591112222"})],   # STANDARD (CUST-002)
+        [("find_customer", {"phone": "+6582094108"})],   # STANDARD (CUST-002)
         [("find_product", {"query": "Industrial Cable"})],
         [("update_enquiry_signals", {"quantity": 30, "business_customer": True})],
         "Thanks - I've noted 30 units for your company.",
     ]
-    agent, tools = build_agent(monkeypatch, script, phone="+6591112222")
+    agent, tools = build_agent(monkeypatch, script, phone="+6582094108")
     result = agent.send("I need 30 Industrial Cable for my company.")
 
     t = agent.last_triage
@@ -136,13 +136,11 @@ def test_scenario_d_new_high_priority(monkeypatch):
     assert t.total_priority_score == 6
     assert t.priority_band == BAND_HIGH_PRIORITY
 
-    # REVISED behaviour: HIGH_PRIORITY auto-refers to sales (a human handoff),
-    # but NOT via the Claude-facing tool, and still NO order / NO discount
-    # approval. (Handoff logger is no-op'd by the harness, so no DB write.)
-    assert agent._auto_handoff_done is True
+    # DECOUPLED behaviour: HIGH_PRIORITY is sales-priority only. It does NOT
+    # create a handoff, an order, or a discount approval. The AI continues.
     assert "create_order" not in tools
     assert "check_discount_authority" not in tools
-    assert "request_human_handoff" not in tools   # tool not used; direct path
+    assert "request_human_handoff" not in tools
     assert agent.pending_approval is None
     _assert_clean(result["response"])
 
@@ -318,20 +316,18 @@ def test_quotation_and_urgent_do_not_confirm_order(monkeypatch):
 # HANDOFF BEHAVIOUR (REVISED)
 # ======================================================================
 
-def test_high_priority_auto_refers_to_sales(monkeypatch):
-    # REVISED requirement: HIGH_PRIORITY automatically refers to sales via a
-    # direct handoff (NOT the Claude-facing request_human_handoff tool), and
-    # does so exactly once. Handoff logger is no-op'd by the harness.
+def test_high_priority_does_not_refer_to_sales(monkeypatch):
+    # DECOUPLED requirement: HIGH_PRIORITY (sales priority) does NOT, by
+    # itself, refer the enquiry to a human. No handoff tool, no order.
     script = [
         [("update_enquiry_signals", {"business_customer": True, "quantity": 100,
                                       "quotation_requested": True, "urgent": True})],
-        "Referred to sales.",
+        "Noted, I'll continue helping you.",
     ]
     agent, tools = build_agent(monkeypatch, script)
     agent.send("Business, 100 units, quotation, urgent.")
     assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
-    assert agent._auto_handoff_done is True
-    assert "request_human_handoff" not in tools   # tool not used; direct path
+    assert "request_human_handoff" not in tools   # no handoff from band alone
     assert "create_order" not in tools
 
 

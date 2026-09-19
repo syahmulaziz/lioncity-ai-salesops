@@ -301,20 +301,17 @@ def test_explicit_handoff(monkeypatch):
 # still never auto-creates an order).
 # ----------------------------------------------------------------------
 
-def test_high_priority_no_auto_order(monkeypatch):
+def test_high_priority_no_auto_order_or_handoff(monkeypatch):
     script = [
         [("update_enquiry_signals", {"business_customer": True, "quantity": 100,
                                       "quotation_requested": True, "urgent": True})],
-        "Thanks, I've referred this to our sales team.",
+        "Thanks, I've noted those details and will continue helping you.",
     ]
     agent, tools = build_agent(monkeypatch, script)
     agent.send("We're a business, need 100 units, quotation, urgent.")
     assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
-    # The automatic handoff does NOT go through the Claude-facing tool.
+    # DECOUPLED: sales priority does not, by itself, hand off or order.
     assert "request_human_handoff" not in tools
-    # But it IS recorded as an automatic sales referral (revised requirement).
-    assert agent._auto_handoff_done is True
-    # Never an automatic order.
     assert "create_order" not in tools
 
 

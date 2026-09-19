@@ -31,6 +31,23 @@ if "dotenv" not in sys.modules:
     _dotenv_stub.load_dotenv = lambda *args, **kwargs: False
     sys.modules["dotenv"] = _dotenv_stub
 
+if "requests" not in sys.modules:
+    # Staging's LLM gateway client imports `requests` at module load; stub it
+    # for offline collection. These tests never make a real HTTP call.
+    _requests_stub = types.ModuleType("requests")
+    _requests_stub.get = _requests_stub.post = _requests_stub.request = (
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("Live HTTP call attempted in an offline test")
+        )
+    )
+
+    class _ReqExc(Exception):
+        pass
+
+    _requests_stub.RequestException = _ReqExc
+    _requests_stub.exceptions = types.SimpleNamespace(RequestException=_ReqExc)
+    sys.modules["requests"] = _requests_stub
+
 from app import agent as agent_module  # noqa: E402
 from app.agent import SalesAgent  # noqa: E402
 from app.enquiry_state import EnquiryState  # noqa: E402
@@ -55,11 +72,10 @@ def make_agent(monkeypatch):
         monkeypatch.setattr(
             agent_module, "get_claude_client", lambda: _FakeClaudeClient()
         )
-        # DB SAFETY: a guest enquiry can now reach HIGH_PRIORITY, which
-        # triggers an automatic handoff -> log_sales_event -> DB write.
-        # No-op the logger by default so these offline tests never mutate the
-        # committed data/lioncity.db. Tests that assert handoff occurred check
-        # activity_log / _auto_handoff_done instead.
+        # DB SAFETY: an explicit human handoff calls log_sales_event, which
+        # would write to the runtime SQLite DB. No-op the logger by default so
+        # these offline tests never mutate data/lioncity.db. (HIGH_PRIORITY by
+        # itself no longer triggers any handoff.)
         monkeypatch.setattr(
             "app.handoff.log_sales_event", lambda **kw: {"success": True}
         )
@@ -309,9 +325,8 @@ def test_high_priority_no_order_or_discount_side_effect(make_agent, monkeypatch)
     assert "human_approval_required" not in logged_types
     # Triage classification still logged.
     assert "triage_evaluated" in logged_types
-    # REVISED behaviour: an automatic sales handoff WAS recorded.
-    assert "human_handoff_requested" in logged_types
-    assert agent._auto_handoff_done is True
+    # DECOUPLED behaviour: HIGH_PRIORITY does NOT create a handoff by itself.
+    assert "human_handoff_requested" not in logged_types
 
 
 # ----------------------------------------------------------------------

@@ -1,6 +1,10 @@
 """
-REVISION Gate 3 - combined quotation preview + HIGH_PRIORITY handoff, plus
-stale-data safety and guest high-value behaviour.
+Combined: quotation preview + decoupled sales-priority, plus stale-data safety
+and guest high-value behaviour.
+
+REVISED: HIGH_PRIORITY is sales priority only and NEVER triggers a handoff by
+itself. These tests confirm the quotation flow still works and that reaching
+HIGH_PRIORITY produces NO handoff.
 
 Offline; handoff log patched to keep the DB clean and count events.
 """
@@ -12,6 +16,7 @@ import pytest
 from tests._agent_harness import build_agent
 from app.triage_config import BAND_HIGH_PRIORITY
 from app.quotation import TBC
+from app.handoff import EVENT_HUMAN_HANDOFF_REQUESTED
 from app.agent import execute_tool as _real_execute
 
 
@@ -51,10 +56,10 @@ def _preview_payloads(agent):
 
 # ----------------------------------------------------------------------
 # 1. quotation request + verified pricing + HIGH_PRIORITY
-#    -> quotation preview + ONE human handoff
+#    -> quotation preview produced, and NO handoff from the band.
 # ----------------------------------------------------------------------
 
-def test_quotation_and_high_priority(monkeypatch):
+def test_quotation_and_high_priority_no_handoff(monkeypatch):
     monkeypatch.setattr(
         "app.agent.execute_tool",
         lambda n, i: (_price_result(6000) if n == "get_customer_price"
@@ -68,16 +73,16 @@ def test_quotation_and_high_priority(monkeypatch):
         [("get_customer_price", {"customer_id": "CUST-001", "sku": "CBL-210",
                                  "quantity": 100})],
         [("generate_quotation_preview", {})],
-        "Here is your preview. I've also referred this to our sales team.",
+        "Here is your preview.",
     ]
     agent, tools = build_agent(monkeypatch, script, phone="+6581658457")
     handoff_log = _capture_handoffs(monkeypatch)
     agent.send("100 Industrial Cable for ABC Construction, quotation urgently.")
 
     assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
-    # Exactly one automatic handoff.
-    high = [e for e in handoff_log if "[high_priority]" in e["details"]]
-    assert len(high) == 1
+    # DECOUPLED: NO handoff was triggered by the band.
+    assert [e for e in handoff_log
+            if e["event_type"] == EVENT_HUMAN_HANDOFF_REQUESTED] == []
     # Preview produced from verified data.
     previews = _preview_payloads(agent)
     assert previews
@@ -85,6 +90,7 @@ def test_quotation_and_high_priority(monkeypatch):
     assert previews[-1]["fields"]["subtotal"] == "SGD 6000.00"
     # No order / no discount approval.
     assert "create_order" not in tools
+    assert "request_human_handoff" not in tools
     assert agent.pending_approval is None
 
 
@@ -156,14 +162,14 @@ def test_product_correction_no_stale_info(monkeypatch):
 
 
 # ----------------------------------------------------------------------
-# 4. Subsequent HIGH_PRIORITY messages -> no duplicate handoff
+# 4. Repeated HIGH_PRIORITY messages -> still no handoff at all.
 # ----------------------------------------------------------------------
 
-def test_subsequent_high_priority_no_duplicate(monkeypatch):
+def test_repeated_high_priority_never_hands_off(monkeypatch):
     script = [
         [("update_enquiry_signals", {"business_customer": True, "quantity": 100,
                                       "quotation_requested": True, "urgent": True})],
-        "Referred.",
+        "Noted.",
         [("update_enquiry_signals", {"urgent": True})],
         "Noted.",
         [("update_enquiry_signals", {"business_customer": True})],
@@ -174,22 +180,24 @@ def test_subsequent_high_priority_no_duplicate(monkeypatch):
     agent.send("Business, 100 units, quotation, urgent.")
     agent.send("Still urgent.")
     agent.send("Still a business.")
-    high = [e for e in handoff_log if "[high_priority]" in e["details"]]
-    assert len(high) == 1
+    assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
+    assert [e for e in handoff_log
+            if e["event_type"] == EVENT_HUMAN_HANDOFF_REQUESTED] == []
+    assert "request_human_handoff" not in tools
 
 
 # ----------------------------------------------------------------------
-# 5. New/guest high-value business customer -> HIGH_PRIORITY + handoff,
-#    no invented customer_id
+# 5. Guest high-value business customer -> HIGH_PRIORITY, NO handoff,
+#    and no invented customer_id. (AI continues serving the guest.)
 # ----------------------------------------------------------------------
 
-def test_guest_high_value_handoff_no_invented_id(monkeypatch):
+def test_guest_high_value_no_handoff_no_invented_id(monkeypatch):
     script = [
         [("find_customer", {"phone": "+6599990002"})],   # not found -> guest
         [("update_enquiry_signals", {"company_name": "ABC Construction",
                                       "business_customer": True, "quantity": 100,
                                       "quotation_requested": True, "urgent": True})],
-        "Referred to sales.",
+        "Noted, I'll continue helping you.",
     ]
     agent, tools = build_agent(monkeypatch, script, phone="+6599990002")
     handoff_log = _capture_handoffs(monkeypatch)
@@ -197,7 +205,6 @@ def test_guest_high_value_handoff_no_invented_id(monkeypatch):
     assert agent.enquiry.existing_customer is False
     assert agent.enquiry.customer_id is None            # not invented
     assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
-    high = [e for e in handoff_log if "[high_priority]" in e["details"]]
-    assert len(high) == 1
-    # handoff context reflects guest, not a fabricated id.
-    assert "customer=guest" in high[0]["details"]
+    assert [e for e in handoff_log
+            if e["event_type"] == EVENT_HUMAN_HANDOFF_REQUESTED] == []
+    assert "request_human_handoff" not in tools

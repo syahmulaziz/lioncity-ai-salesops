@@ -1,5 +1,8 @@
 """
-REVISION Gate 1 - HIGH_PRIORITY automatic human sales handoff (idempotent).
+HITL DECOUPLING (revised architecture): sales-priority band NEVER, by itself,
+triggers a human handoff. Human handoff comes only from an EXPLICIT customer
+request (or, separately, the teammate discount-approval workflow for discounts
+beyond AI authority).
 
 Offline, scripted mock Claude. app.handoff.log_sales_event is monkeypatched so
 handoff events are counted in-memory and the committed DB is never touched.
@@ -31,11 +34,15 @@ def _capture_handoffs(monkeypatch):
     return events
 
 
-# ----------------------------------------------------------------------
-# 1. ROUTINE does not automatically hand off
-# ----------------------------------------------------------------------
+def _handoff_count(events):
+    return [e for e in events if e["event_type"] == EVENT_HUMAN_HANDOFF_REQUESTED]
 
-def test_routine_no_auto_handoff(monkeypatch):
+
+# ======================================================================
+# PRIORITY BAND ALONE NEVER TRIGGERS HITL
+# ======================================================================
+
+def test_routine_no_handoff(monkeypatch):
     script = [
         [("update_enquiry_signals", {"urgent": True})],  # total 1 -> ROUTINE
         "Noted.",
@@ -44,15 +51,11 @@ def test_routine_no_auto_handoff(monkeypatch):
     handoff_log = _capture_handoffs(monkeypatch)
     agent.send("It's a bit urgent.")
     assert agent.last_triage.priority_band == BAND_ROUTINE
-    assert handoff_log == []
-    assert agent._auto_handoff_done is False
+    assert _handoff_count(handoff_log) == []
+    assert "request_human_handoff" not in tools
 
 
-# ----------------------------------------------------------------------
-# 2. SALES_OPPORTUNITY does not automatically hand off
-# ----------------------------------------------------------------------
-
-def test_sales_opportunity_no_auto_handoff(monkeypatch):
+def test_sales_opportunity_no_handoff(monkeypatch):
     script = [
         # quotation(2) + urgent(1) = 3 -> SALES_OPPORTUNITY
         [("update_enquiry_signals", {"quotation_requested": True, "urgent": True})],
@@ -62,58 +65,50 @@ def test_sales_opportunity_no_auto_handoff(monkeypatch):
     handoff_log = _capture_handoffs(monkeypatch)
     agent.send("Quotation, urgent.")
     assert agent.last_triage.priority_band == BAND_SALES_OPPORTUNITY
-    assert handoff_log == []
+    assert _handoff_count(handoff_log) == []
+    assert "request_human_handoff" not in tools
 
 
-# ----------------------------------------------------------------------
-# 3. HIGH_PRIORITY automatically creates a human sales handoff
-# ----------------------------------------------------------------------
-
-def test_high_priority_auto_handoff(monkeypatch):
+def test_high_priority_no_handoff(monkeypatch):
+    # The central decoupling assertion: HIGH_PRIORITY on its own does NOT
+    # create any handoff, and the AI keeps handling the enquiry.
     script = [
         [("update_enquiry_signals", {"business_customer": True, "quantity": 100,
                                       "quotation_requested": True, "urgent": True})],
-        "Thanks - I've referred this to our sales team.",
+        "Thanks, I've noted those details.",
     ]
     agent, tools = build_agent(monkeypatch, script)
     handoff_log = _capture_handoffs(monkeypatch)
     agent.send("Business, 100 units, quotation, urgent.")
     assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
-    assert len(handoff_log) == 1
-    assert handoff_log[0]["event_type"] == EVENT_HUMAN_HANDOFF_REQUESTED
-    assert "[high_priority]" in handoff_log[0]["details"]
-    assert agent._auto_handoff_done is True
+    assert _handoff_count(handoff_log) == []          # NO handoff
+    assert "request_human_handoff" not in tools
+    assert "create_order" not in tools                # no order
+    assert "check_discount_authority" not in tools    # no discount
+    assert agent.pending_approval is None             # no approval
 
 
-# ----------------------------------------------------------------------
-# 4. Re-evaluating the same HIGH_PRIORITY enquiry does NOT duplicate
-# ----------------------------------------------------------------------
-
-def test_high_priority_handoff_idempotent(monkeypatch):
+def test_high_priority_still_calculated_correctly(monkeypatch):
+    # HIGH_PRIORITY must still be computed/stored/logged even though it no
+    # longer triggers a side effect.
     script = [
         [("update_enquiry_signals", {"business_customer": True, "quantity": 100,
                                       "quotation_requested": True, "urgent": True})],
-        "Referred to sales.",
-        # Another message that keeps it HIGH_PRIORITY (re-evaluates triage).
-        [("update_enquiry_signals", {"urgent": True})],
-        "Still noted.",
-        # And another.
-        [("update_enquiry_signals", {"quotation_requested": True})],
-        "Noted again.",
+        "Noted.",
     ]
     agent, tools = build_agent(monkeypatch, script)
-    handoff_log = _capture_handoffs(monkeypatch)
+    _capture_handoffs(monkeypatch)
     agent.send("Business, 100 units, quotation, urgent.")
-    agent.send("Still urgent please.")
-    agent.send("Yes I still want a quotation.")
-    assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
-    # Exactly ONE auto handoff across all re-evaluations.
-    assert len(handoff_log) == 1
+    t = agent.last_triage
+    assert t.priority_band == BAND_HIGH_PRIORITY
+    assert t.opportunity_value_score == 6             # business1+bulk2+quote2+urgent1
+    # It was logged internally (never shown to the customer).
+    assert any(e["type"] == "triage_evaluated" for e in agent.activity_log)
 
 
-# ----------------------------------------------------------------------
-# 5. Explicit human request creates handoff regardless of score
-# ----------------------------------------------------------------------
+# ======================================================================
+# EXPLICIT HUMAN REQUEST TRIGGERS HANDOFF AT EVERY BAND
+# ======================================================================
 
 def test_explicit_request_handoff_at_routine(monkeypatch):
     script = [
@@ -122,37 +117,63 @@ def test_explicit_request_handoff_at_routine(monkeypatch):
     ]
     agent, tools = build_agent(monkeypatch, script)
     handoff_log = _capture_handoffs(monkeypatch)
-    agent.send("Can a salesperson call me?")  # no sales signals -> ROUTINE band
+    agent.send("Can a salesperson call me?")          # no sales signals
+    # Explicit request hands off regardless of sales priority (here the turn
+    # carries no sales signals, so triage isn't even evaluated).
     assert agent.enquiry.human_requested is True
-    assert len(handoff_log) == 1
+    assert len(_handoff_count(handoff_log)) == 1
     assert "[explicit_request]" in handoff_log[0]["details"]
 
 
-def test_explicit_and_auto_are_distinct_triggers(monkeypatch):
-    # Explicit request AND high priority in one enquiry: distinct triggers,
-    # and the automatic one still fires at most once.
+def test_explicit_request_handoff_at_sales_opportunity(monkeypatch):
     script = [
-        [("update_enquiry_signals", {"business_customer": True, "quantity": 100,
-                                      "quotation_requested": True, "urgent": True})],
-        "Referred to sales.",
-        [("request_human_handoff", {"reason": "customer asked for a salesperson"})],
-        "Also flagged explicitly.",
+        # Reach SALES_OPPORTUNITY, then explicitly ask for a person.
+        [("update_enquiry_signals", {"quotation_requested": True, "urgent": True}),
+         ("request_human_handoff", {"reason": "customer asked for a salesperson"})],
+        "Flagged for sales.",
     ]
     agent, tools = build_agent(monkeypatch, script)
     handoff_log = _capture_handoffs(monkeypatch)
-    agent.send("Business, 100 units, quotation, urgent.")   # auto handoff (1)
-    agent.send("Actually, please connect me to sales.")     # explicit handoff (1)
-    triggers = [e["details"].split("]")[0] + "]" for e in handoff_log]
-    assert "[high_priority]" in " ".join(triggers)
-    assert "[explicit_request]" in " ".join(triggers)
-    # Auto handoff still only once even though it stayed HIGH_PRIORITY.
-    high = [e for e in handoff_log if "[high_priority]" in e["details"]]
-    assert len(high) == 1
+    agent.send("Quotation, urgent, and please connect me to sales.")
+    assert agent.last_triage.priority_band == BAND_SALES_OPPORTUNITY
+    assert len(_handoff_count(handoff_log)) == 1
+    assert "[explicit_request]" in handoff_log[0]["details"]
 
 
-# ----------------------------------------------------------------------
-# 6. Handoff failure does not falsely tell the customer it succeeded
-# ----------------------------------------------------------------------
+def test_explicit_request_handoff_at_high_priority(monkeypatch):
+    script = [
+        [("update_enquiry_signals", {"business_customer": True, "quantity": 100,
+                                      "quotation_requested": True, "urgent": True}),
+         ("request_human_handoff", {"reason": "customer asked for a salesperson"})],
+        "Flagged for sales.",
+    ]
+    agent, tools = build_agent(monkeypatch, script)
+    handoff_log = _capture_handoffs(monkeypatch)
+    agent.send("Business, 100 units, quotation, urgent - and connect me to sales.")
+    assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
+    # Exactly one handoff, and it is the EXPLICIT one (not a band-triggered one).
+    assert len(_handoff_count(handoff_log)) == 1
+    assert "[explicit_request]" in handoff_log[0]["details"]
+    assert "[high_priority]" not in handoff_log[0]["details"]
+
+
+def test_explicit_handoff_distinct_from_discount_approval(monkeypatch):
+    # Explicit handoff uses the sales_events handoff path, NOT the discount
+    # approval workflow (pending_approval stays untouched).
+    script = [
+        [("request_human_handoff", {"reason": "customer asked for a salesperson"})],
+        "Flagged.",
+    ]
+    agent, tools = build_agent(monkeypatch, script)
+    handoff_log = _capture_handoffs(monkeypatch)
+    agent.send("Please get me a salesperson.")
+    assert len(_handoff_count(handoff_log)) == 1
+    assert agent.pending_approval is None             # not a discount approval
+
+
+# ======================================================================
+# HANDOFF FAILURE IS NOT REPORTED AS SUCCESS
+# ======================================================================
 
 def test_handoff_failure_not_false_success(monkeypatch):
     script = [
@@ -167,8 +188,6 @@ def test_handoff_failure_not_false_success(monkeypatch):
         lambda **kw: (_ for _ in ()).throw(RuntimeError("db down")),
     )
     agent.send("Connect me to sales.")
-    # The tool result the agent saw reports failure (not a fake success).
-    # Find the recorded activity for the handoff.
     handoff_entries = [e for e in agent.activity_log
                        if e["type"] == "human_handoff_requested"]
     assert handoff_entries
@@ -177,20 +196,39 @@ def test_handoff_failure_not_false_success(monkeypatch):
     assert result["status"] == "ERROR"
 
 
-# ----------------------------------------------------------------------
-# 7 & 8. HIGH_PRIORITY does NOT auto-create order / auto-approve discount
-# ----------------------------------------------------------------------
+# ======================================================================
+# GOLD HERO-FLOW REGRESSION: HIGH_PRIORITY continues autonomously
+# ======================================================================
 
-def test_high_priority_no_order_no_discount_approval(monkeypatch):
+def test_gold_hero_high_priority_continues_autonomously(monkeypatch):
+    """
+    Regression for the review's AWS hero principle: a normal authorised GOLD
+    business customer with a large quantity may classify HIGH_PRIORITY, but
+    the AI must keep serving them - NO handoff, NO approval, NO order created
+    merely because of the priority band.
+
+    NOTE: this isolates the PRIORITY->HANDOFF decoupling. It does NOT assert
+    anything about a high-quantity HITL threshold, which remains UNDEFINED.
+    We use verified seed identifiers (CUST-001 / GOLD / +6581658457), not the
+    review's older 'Apex Engineering' name, because staging renamed CUST-001.
+    """
     script = [
-        [("update_enquiry_signals", {"business_customer": True, "quantity": 100,
-                                      "quotation_requested": True, "urgent": True})],
-        "Referred to sales.",
+        [("find_customer", {"phone": "+6581658457"})],   # CUST-001 GOLD (staging seed)
+        [("find_product", {"query": "Industrial Cable"})],
+        [("update_enquiry_signals", {"business_customer": True, "quantity": 300})],
+        "Sure - let me sort that out for you.",
     ]
-    agent, tools = build_agent(monkeypatch, script)
-    _capture_handoffs(monkeypatch)
-    agent.send("Business, 100 units, quotation, urgent.")
+    agent, tools = build_agent(monkeypatch, script, phone="+6581658457")
+    handoff_log = _capture_handoffs(monkeypatch)
+    agent.send("Same order as last month but CBL-210 make it 300. Jurong Tuesday, same price can?")
+
+    # GOLD + business + bulk -> HIGH_PRIORITY.
+    assert agent.enquiry.existing_customer is True
+    assert agent.enquiry.customer_tier == "GOLD"
     assert agent.last_triage.priority_band == BAND_HIGH_PRIORITY
-    assert "create_order" not in tools
-    assert "check_discount_authority" not in tools
+    # ...yet the AI continues autonomously:
+    assert _handoff_count(handoff_log) == []          # NO human handoff
+    assert "request_human_handoff" not in tools
+    assert "create_order" not in tools                # no auto order
+    assert "check_discount_authority" not in tools    # no discount involved
     assert agent.pending_approval is None
