@@ -40,6 +40,32 @@ def create_tables():
         )
     """)
 
+    # HAFIZAH: ADD CREATE PRODUCT AND INVENTORY TABLE 
+    # =====================================================
+    # PRODUCTS
+    # =====================================================
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            sku TEXT PRIMARY KEY,
+            product_name TEXT NOT NULL,
+            description TEXT,
+            category TEXT,
+            list_price REAL NOT NULL) 
+    """)
+
+    # =====================================================
+    # INVENTORY
+    # =====================================================
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            sku TEXT PRIMARY KEY,
+            available_quantity INTEGER NOT NULL,
+            FOREIGN KEY (sku)
+                REFERENCES products(sku))
+    """)
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         order_id TEXT PRIMARY KEY,
