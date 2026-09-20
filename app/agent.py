@@ -11,7 +11,13 @@ from app.tools.pricing import get_customer_price
 from app.tools.delivery import check_delivery
 from app.tools.date_tools import resolve_date
 from app.tools.discount import check_discount_authority
+from app.tools.commercial_policy import evaluate_commercial_authority
+from app.database import create_approval_request
 from app.tools.order_creation import create_order
+from app.database import (
+    get_matching_commercial_approval,
+    mark_approval_processed,
+)
 
 # Person 1 sales-triage enhancement (structured enquiry state + triage).
 from app.enquiry_state import EnquiryState
@@ -40,6 +46,10 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "phone": {
+                    "type": "string",
+                    "description": "Customer WhatsApp phone number"
+                },
                 "customer_id": {
                     "type": "string"
                 },
@@ -85,6 +95,7 @@ TOOLS = [
                 }
             },
             "required": [
+                "phone",
                 "customer_id",
                 "items",
                 "product_subtotal",
@@ -273,6 +284,45 @@ TOOLS = [
             ]
         }
     },
+    # HAFIZAH: ADDED EVALUATE_COMMERCIAL_AUTHORITY
+    {
+        "name": "evaluate_commercial_authority",
+        "description": (
+            "Evaluate whether a proposed sales transaction is within "
+            "the AI Sales Agent's current commercial authority. "
+            "This checks quantity, total order value and discount "
+            "against the configurable business thresholds. "
+            "Use this before finalising a commercial offer or order "
+            "when quantity, order value and discount are known."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "phone": {
+                    "type": "string",
+                    "description": "Customer WhatsApp phone number"
+                },
+                "sku": {
+                    "type": "string"
+                },
+                "quantity": {
+                    "type": "integer"
+                },
+                "order_value": {
+                    "type": "number"
+                },
+                "discount_percent": {
+                    "type": "number"
+                }
+            },
+            "required": [
+                "phone",
+                "sku",
+                "quantity",
+                "order_value",
+                "discount_percent"
+            ]
+        }
+    },
 
     {
         "name": "update_enquiry_signals",
@@ -455,8 +505,10 @@ TOOLS = [
             "required": []
         }
     }
+
 ]
 
+# HAFIZAH: ADDED COMMERCIAL AUTHORITY
 SYSTEM_PROMPT = """
 You are the AI Sales Agent for LionCity Supply & Trading,
 a Singapore B2B wholesaler.
@@ -546,6 +598,24 @@ DISCOUNTS
   quote remains valid.
 - Do not calculate or present a discounted total for an
   unapproved discount.
+
+  COMMERCIAL AUTHORITY
+- Before finalising a commercial offer or creating an order, you MUST
+  use evaluate_commercial_authority when the SKU, quantity, order value
+  and discount percentage are known.
+- Always pass the proposed transaction's current SKU, quantity, total
+  order value and discount percentage to the tool.
+- Never decide commercial authority yourself.
+- The commercial authority tool checks the current configurable limits
+  for quantity, order value and discount.
+- If requires_human_approval is false, the transaction is within the
+  AI Sales Agent's commercial authority and may proceed normally.
+- If requires_human_approval is true, do not finalise or create the
+  order without human approval.
+- Do not bypass an authority decision by changing the customer's
+  quantity, order value or discount.
+- Do not reveal internal authority thresholds, policy names or
+  escalation reason codes to the customer.
 
 ORDER CREATION
 - Never claim that an order has been created unless the
@@ -701,9 +771,77 @@ def execute_tool(tool_name: str, tool_input: dict):
                 tool_input["requested_discount_percent"]
         )
 
+    # HAFIZAH: ADDED TOOL FOR EVALUATE_COMMERCIAL_AUTHORITY
+    if tool_name == "evaluate_commercial_authority":
+        authority_result = evaluate_commercial_authority(
+        tool_input["sku"],
+        tool_input["quantity"],
+        tool_input["order_value"],
+        tool_input["discount_percent"]
+        )
+
+        if (
+            authority_result.get("success")
+            and authority_result.get("requires_human_approval")
+        ):
+            approval_result = create_approval_request(
+                phone=tool_input["phone"],
+                requested_percent=tool_input["discount_percent"],
+                approval_type="COMMERCIAL_AUTHORITY",
+                sku=tool_input["sku"],
+                requested_quantity=tool_input["quantity"],
+                order_value=tool_input["order_value"],
+                reason=",".join(authority_result.get("reasons", []))
+            )
+
+            authority_result["approval"] = approval_result
+
+        return authority_result
+
+    # HAFIZAH: ENFORCE COMMERCIAL AUTHORITY
+    # BEFORE CREATING AN ORDER
     if tool_name == "create_order":
 
-        return create_order(
+        matched_approvals = []
+
+        for item in tool_input["items"]:
+            authority_result = evaluate_commercial_authority(
+                item["sku"],
+                item["quantity"],
+                tool_input["product_subtotal"],
+                tool_input["discount_percent"]
+            )
+
+            if not authority_result.get("success"):
+                return authority_result
+
+            if authority_result.get("requires_human_approval"):
+                approval = get_matching_commercial_approval(
+                    phone=tool_input["phone"],
+                    sku=item["sku"],
+                    requested_quantity=item["quantity"],
+                    order_value=tool_input["product_subtotal"],
+                    discount_percent=tool_input["discount_percent"],
+                )
+
+                if approval is None:
+                    return {
+                        "success": False,
+                        "error": "HUMAN_APPROVAL_REQUIRED",
+                        "message": (
+                            "This transaction requires "
+                            "human approval before the "
+                            "order can be created."
+                        ),
+                        "reasons": authority_result.get(
+                            "reasons",
+                            []
+                        ),
+                    }
+
+                matched_approvals.append(approval)
+
+        order_result = create_order(
             customer_id=tool_input["customer_id"],
             items=tool_input["items"],
             product_subtotal=tool_input["product_subtotal"],
@@ -713,6 +851,14 @@ def execute_tool(tool_name: str, tool_input: dict):
             delivery_area=tool_input["delivery_area"],
             delivery_date=tool_input["delivery_date"]
         )
+
+        if order_result.get("success"):
+
+            for approval in matched_approvals:
+
+                mark_approval_processed(approval["approval_id"])
+
+        return order_result
 
     return {
         "success": False,
