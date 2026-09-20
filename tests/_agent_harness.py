@@ -136,3 +136,52 @@ def build_agent(monkeypatch, script, phone="+6580000000"):
 
     agent = SalesAgent(phone=phone)
     return agent, tool_calls
+
+
+# Default commercial-policy values, matching PR #2's seed_commercial_policies()
+# defaults in app/database.py. Tests exercise the REAL PR #2 authority logic
+# against these controlled values.
+DEFAULT_TEST_COMMERCIAL_POLICIES = [
+    {"policy_key": "MAX_QUANTITY_PER_SKU", "policy_value": 500,
+     "description": "Maximum quantity per SKU the AI can approve"},
+    {"policy_key": "MAX_ORDER_VALUE", "policy_value": 10000,
+     "description": "Maximum order value the AI can approve without human approval"},
+    {"policy_key": "MAX_DISCOUNT_PERCENT", "policy_value": 5,
+     "description": "Maximum discount percentage the AI can approve"},
+]
+
+
+def patch_commercial_policies(monkeypatch, policies=None):
+    """
+    Provide controlled commercial-policy state to the PR #2 authority path
+    WITHOUT touching the shared runtime DB (data/lioncity.db).
+
+    PR #2's app/tools/discount.py and app/tools/commercial_policy.py both
+    resolve limits via app.database.get_commercial_policies(). The existing
+    runtime test DB predates PR #2 and has no commercial_policies table, so
+    that lookup raises. We patch the lookup AT THE LOCATIONS WHERE THE CODE
+    UNDER TEST ACTUALLY CALLS IT (each module imported the symbol by name),
+    returning controlled data. The real _get_discount_limit() /
+    check_discount_authority() / evaluate_commercial_authority() decision
+    logic still runs — we do NOT bypass the authority decision.
+    """
+    data = list(policies) if policies is not None else list(
+        DEFAULT_TEST_COMMERCIAL_POLICIES
+    )
+
+    def _fake_get_commercial_policies():
+        return [dict(p) for p in data]
+
+    # discount.py does `from app.database import get_commercial_policies`,
+    # so the bound name lives in app.tools.discount.
+    monkeypatch.setattr(
+        "app.tools.discount.get_commercial_policies",
+        _fake_get_commercial_policies,
+    )
+    # commercial_policy.py binds it the same way (used by quantity/value
+    # authority + evaluate_commercial_authority).
+    monkeypatch.setattr(
+        "app.tools.commercial_policy.get_commercial_policies",
+        _fake_get_commercial_policies,
+    )
+    return data

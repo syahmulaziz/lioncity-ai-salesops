@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from tests._agent_harness import build_agent
+from tests._agent_harness import build_agent, patch_commercial_policies
 from app.triage_config import BAND_HIGH_PRIORITY
 from app.handoff import EVENT_HUMAN_HANDOFF_REQUESTED
 from app import database
@@ -244,17 +244,29 @@ def test_previous_order_uses_customer_then_orders(monkeypatch):
 # ----------------------------------------------------------------------
 
 def test_small_discount_uses_authority(monkeypatch):
+    # Provide PR #2 commercial policy (MAX_DISCOUNT_PERCENT = 5) so the real
+    # authority decision runs. Without this the DB-backed lookup would raise
+    # and pending_approval would be None for the WRONG reason (tool error),
+    # not because 3% is genuinely within authority.
+    patch_commercial_policies(monkeypatch)
     script = [
         [("check_discount_authority", {"requested_discount_percent": 3})],
         "I can apply that discount.",
     ]
     agent, tools = build_agent(monkeypatch, script)
-    agent.send("Can I get 3% off?")
+    result = agent.send("Can I get 3% off?")
     assert "check_discount_authority" in tools
-    assert agent.pending_approval is None  # 3% within AI authority
+    assert agent.pending_approval is None  # 3% within AI authority (<= 5%)
+    # Prove the authority tool executed successfully (not the error path).
+    assert result["success"] is True
 
 
 def test_large_discount_triggers_hitl(monkeypatch):
+    # PR #2 resolves the AI discount limit from commercial policy
+    # (MAX_DISCOUNT_PERCENT = 5). Provide that policy state to the real
+    # authority path without touching the runtime DB. A 10% request exceeds
+    # the 5% limit, so the genuine authority decision requires human approval.
+    patch_commercial_policies(monkeypatch)
     script = [
         [("check_discount_authority", {"requested_discount_percent": 10})],
         "I've sent that request for review.",
@@ -265,6 +277,8 @@ def test_large_discount_triggers_hitl(monkeypatch):
     # Existing HITL behaviour: pending approval recorded.
     assert agent.pending_approval is not None
     assert agent.pending_approval["requested_discount_percent"] == 10
+    # The decision was driven by the configured policy limit, not bypassed.
+    assert agent.pending_approval["ai_authority_limit_percent"] == 5
 
 
 # ----------------------------------------------------------------------

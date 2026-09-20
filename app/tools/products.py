@@ -170,3 +170,32 @@ def list_products():
         "count": len(rows),
         "products": [_row_to_product(row) for row in rows],
     }
+
+
+def list_catalogue():
+    """
+    Trusted broad-catalogue listing for customer-facing "what do you sell?"
+    style enquiries.
+
+    Returns ONLY the customer-safe catalogue fields sourced from the
+    authoritative products table: sku and product_name. It deliberately does
+    NOT include category, list_price, or any stock/availability figure -
+    category could encourage invented grouping wording, and stock stays with
+    check_inventory. Neither is exposed in a broad catalogue response.
+
+    The response the agent gives must be grounded ONLY in what this returns;
+    the LLM must not add products or categories that are not present here.
+    """
+    rows = _fetch_all_products()
+    products = [
+        {
+            "sku": row["sku"],
+            "product_name": row["product_name"],
+        }
+        for row in rows
+    ]
+    return {
+        "success": True,
+        "count": len(products),
+        "products": products,
+    }
