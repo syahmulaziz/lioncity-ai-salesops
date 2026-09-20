@@ -40,6 +40,32 @@ def create_tables():
         )
     """)
 
+    # HAFIZAH: ADD CREATE PRODUCT AND INVENTORY TABLE 
+    # =====================================================
+    # PRODUCTS
+    # =====================================================
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            sku TEXT PRIMARY KEY,
+            product_name TEXT NOT NULL,
+            description TEXT,
+            category TEXT,
+            list_price REAL NOT NULL) 
+    """)
+
+    # =====================================================
+    # INVENTORY
+    # =====================================================
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS inventory (
+            sku TEXT PRIMARY KEY,
+            available_quantity INTEGER NOT NULL,
+            FOREIGN KEY (sku)
+                REFERENCES products(sku))
+    """)
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (
         order_id TEXT PRIMARY KEY,
@@ -90,6 +116,7 @@ def create_tables():
     )
     """)
 
+    # HAFIZAH: ADDED sku, requested_quantity, order_value and reason
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS approval_requests (
             approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,9 +125,39 @@ def create_tables():
             requested_percent REAL NOT NULL,
             approved_percent REAL,
             status TEXT NOT NULL DEFAULT 'PENDING',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            sku TEXT,
+            requested_quantity INTEGER,
+            order_value REAL,
+            reason TEXT
         )
     """)
+
+    # HAFIZAH: UPGRADE EXISTING APPROVAL_REQUESTS TABLE
+    # Existing deployments may already have approval_requests
+    # without the commercial authority fields.
+    cursor.execute("""
+        PRAGMA table_info(approval_requests)
+    """)
+
+    existing_columns = {
+        row["name"]
+        for row in cursor.fetchall()
+    }
+
+    approval_columns = {
+        "sku": "TEXT",
+        "requested_quantity": "INTEGER",
+        "order_value": "REAL",
+        "reason": "TEXT",
+    }
+
+    for column_name, column_type in approval_columns.items():
+        if column_name not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE approval_requests "
+                f"ADD COLUMN {column_name} {column_type}"
+            )
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_messages (
@@ -122,8 +179,110 @@ def create_tables():
         )
     """)
 
+    # HAFIZAH: ADDED COMMERCIAL_POLICIES TABLE
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS commercial_policies (
+            policy_key TEXT PRIMARY KEY,
+            policy_value REAL NOT NULL,
+            description TEXT)
+    """) 
+
     connection.commit()
     connection.close()
+
+# HAFIZAH: ADDED SEED_COMMERCIAL_POLICIES() AND GET_COMMERCIAL_POLICIES()
+def seed_commercial_policies():
+    """
+    Insert default AI commercial authority limits
+
+    Existing values are preserved so that settings changed
+    through the admin dashboard are not overwritten.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    policies = [
+        (
+            "MAX_QUANTITY_PER_SKU",
+            500,
+            "Maximum quantity per SKU the AI can approve"
+        ),(
+            "MAX_ORDER_VALUE",
+            10000,
+            "Maximum order value the AI can approve without human approval"
+        ),(
+            "MAX_DISCOUNT_PERCENT",
+            5,
+            "Maximum discount percentage the AI can approve"
+        )
+    ]
+
+    cursor.executemany("""
+        INSERT OR IGNORE INTO commercial_policies(
+            policy_key,
+            policy_value,
+            description)
+        VALUES (?, ?, ?)
+    """, policies)
+
+    connection.commit()
+    connection.close()
+
+# HAFIZAH: ADDED GET_COMMERCIAL_POLICIES()
+def get_commercial_policies():
+    """
+    Return all commercial policy settings.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT policy_key, policy_value, description
+        FROM commercial_policies
+        ORDER BY policy_key
+    """)
+
+    rows = cursor.fetchall()
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+# HAFIZAH: ADDED UPDATE_COMMERCIAL_POLICY()
+def update_commercial_policy (policy_key: str, policy_value: float):
+    """
+    Update an existing commercial policy threshold
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        UPDATE commercial_policies
+        SET policy_value = ?
+        WHERE policy_key = ?
+    """, (policy_value, policy_key))
+
+    if cursor.rowcount == 0:
+        connection.close()
+
+        return {
+            "success": False,
+            "error": "POLICY_NOT_FOUND",
+            "policy_key": policy_key
+        }
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "policy_key": policy_key,
+        "policy_value": policy_value
+    }
+
+
 
 def seed_customers():
     """
@@ -612,12 +771,22 @@ def update_delivery_capacity(
             remaining_capacity
     }
 
+# HAFIZAH: REPLACED CREATE_APPROVAL_REQUEST TO
+# SUPPORT SKU, REQUESTED_QUANTITY, ORDER_VALUE AND REASON
 def create_approval_request(
     phone: str,
-    requested_percent: float
+    requested_percent: float = 0,
+    approval_type: str = "DISCOUNT",
+    sku: str = None,
+    requested_quantity: int = None,
+    order_value: float = None,
+    reason: str = None,
 ):
     """
     Create a human approval request.
+
+    Supports discount approvals and commercial authority
+    escalations such as high quantity and high order value.
 
     A customer may only have one unresolved approval
     request at a time.
@@ -640,8 +809,13 @@ def create_approval_request(
         SELECT
             approval_id,
             status,
+            approval_type,
             requested_percent,
-            approved_percent
+            approved_percent,
+            sku,
+            requested_quantity,
+            order_value,
+            reason
         FROM approval_requests
         WHERE phone = ?
           AND status IN ('PENDING', 'APPROVED')
@@ -657,15 +831,16 @@ def create_approval_request(
 
         result = {
             "success": True,
-            "approval_id":
-                existing["approval_id"],
+            "approval_id": existing["approval_id"],
             "already_exists": True,
-            "status":
-                existing["status"],
-            "requested_percent":
-                existing["requested_percent"],
-            "approved_percent":
-                existing["approved_percent"],
+            "status": existing["status"],
+            "approval_type": existing["approval_type"],
+            "requested_percent": existing["requested_percent"],
+            "approved_percent": existing["approved_percent"],
+            "sku": existing["sku"],
+            "requested_quantity": existing["requested_quantity"],
+            "order_value": existing["order_value"],
+            "reason": existing["reason"],
         }
 
         connection.close()
@@ -682,12 +857,21 @@ def create_approval_request(
             phone,
             approval_type,
             requested_percent,
-            status
+            status,
+            sku,
+            requested_quantity,
+            order_value,
+            reason
         )
-        VALUES (?, 'DISCOUNT', ?, 'PENDING')
+        VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?)
     """, (
         phone,
+        approval_type,
         requested_percent,
+        sku,
+        requested_quantity,
+        order_value,
+        reason,
     ))
 
     approval_id = cursor.lastrowid
@@ -700,56 +884,13 @@ def create_approval_request(
         "approval_id": approval_id,
         "already_exists": False,
         "status": "PENDING",
-        "requested_percent":
-            requested_percent,
+        "approval_type": approval_type,
+        "requested_percent": requested_percent,
         "approved_percent": None,
-    }
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    # Avoid duplicate pending requests.
-    cursor.execute("""
-        SELECT approval_id
-        FROM approval_requests
-        WHERE phone = ?
-          AND status = 'PENDING'
-        ORDER BY approval_id DESC
-        LIMIT 1
-    """, (phone,))
-
-    existing = cursor.fetchone()
-
-    if existing is not None:
-        connection.close()
-
-        return {
-            "success": True,
-            "approval_id": existing["approval_id"],
-            "already_exists": True
-        }
-
-    cursor.execute("""
-        INSERT INTO approval_requests (
-            phone,
-            approval_type,
-            requested_percent,
-            status
-        )
-        VALUES (?, 'DISCOUNT', ?, 'PENDING')
-    """, (
-        phone,
-        requested_percent
-    ))
-
-    approval_id = cursor.lastrowid
-
-    connection.commit()
-    connection.close()
-
-    return {
-        "success": True,
-        "approval_id": approval_id,
-        "already_exists": False
+        "sku": sku,
+        "requested_quantity": requested_quantity,
+        "order_value": order_value,
+        "reason": reason,
     }
 
 
@@ -820,6 +961,46 @@ def get_approved_unprocessed_requests():
 
     return [dict(row) for row in rows]
 
+# HAFIZAH: FIND MATCHING COMMERCIAL AUTHORITY APPROVAL
+def get_matching_commercial_approval(
+    phone: str,
+    sku: str,
+    requested_quantity: int,
+    order_value: float,
+    discount_percent: float,
+):
+    """
+    Return an approved commercial-authority request
+    matching the proposed transaction.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM approval_requests
+        WHERE phone = ?
+          AND approval_type = 'COMMERCIAL_AUTHORITY'
+          AND status = 'APPROVED'
+          AND sku = ?
+          AND requested_quantity = ?
+          AND ABS(order_value - ?) < 0.01
+          AND ABS(approved_percent - ?) < 0.01
+        ORDER BY approval_id DESC
+        LIMIT 1
+    """, (
+        phone,
+        sku,
+        requested_quantity,
+        order_value,
+        discount_percent,
+    ))
+
+    row = cursor.fetchone()
+    connection.close()
+
+    return dict(row) if row else None
 
 def mark_approval_processed(
     approval_id: int
@@ -1548,6 +1729,7 @@ if __name__ == "__main__":
 
     create_tables()
 
+    seed_commercial_policies()
     seed_customers()
     seed_products()
     seed_inventory()
