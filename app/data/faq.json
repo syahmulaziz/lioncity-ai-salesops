@@ -1,0 +1,101 @@
+{
+  "_meta": {
+    "description": "Static, trusted FAQ source for LionCity general enquiries. Each topic carries a 'confirmed' flag. UNCONFIRMED values are placeholders only and MUST NOT be sent to customers as real business facts. The team will supply/confirm real values later.",
+    "confirmed_legend": {
+      "true": "Value is a real, confirmed LionCity business fact and may be shown to customers.",
+      "false": "Value is an UNCONFIRMED placeholder. Never expose as a trusted answer."
+    }
+  },
+  "topics": {
+    "operating_hours": {
+      "confirmed": false,
+      "answer": "UNCONFIRMED — operating hours not yet provided by the LionCity team.",
+      "aliases": [
+        "operating hours",
+        "opening hours",
+        "business hours",
+        "what time do you open",
+        "what time do you close",
+        "when do you open",
+        "when do you close",
+        "are you open",
+        "are you open today",
+        "hours"
+      ]
+    },
+    "location": {
+      "confirmed": false,
+      "answer": "UNCONFIRMED — business address/location not yet provided by the LionCity team.",
+      "aliases": [
+        "location",
+        "address",
+        "where are you located",
+        "where are you",
+        "whats your address",
+        "what is your address",
+        "how do i find you",
+        "directions"
+      ]
+    },
+    "payment_methods": {
+      "confirmed": false,
+      "answer": "UNCONFIRMED — accepted payment methods not yet provided by the LionCity team.",
+      "aliases": [
+        "payment methods",
+        "payment",
+        "how do i pay",
+        "how can i pay",
+        "what payment do you accept",
+        "do you accept credit card",
+        "payment options"
+      ]
+    },
+    "delivery_policy": {
+      "confirmed": false,
+      "answer": "UNCONFIRMED — general delivery policy not yet provided by the LionCity team.",
+      "aliases": [
+        "delivery policy",
+        "do you deliver",
+        "delivery information",
+        "shipping policy",
+        "how does delivery work"
+      ]
+    },
+    "quotation_process": {
+      "confirmed": false,
+      "answer": "UNCONFIRMED — quotation process description not yet provided by the LionCity team.",
+      "aliases": [
+        "quotation process",
+        "how do i get a quote",
+        "how do quotations work",
+        "how to request a quotation",
+        "quote process"
+      ]
+    },
+    "contact_info": {
+      "confirmed": false,
+      "answer": "UNCONFIRMED — general contact details not yet provided by the LionCity team.",
+      "aliases": [
+        "contact",
+        "contact info",
+        "contact information",
+        "how do i contact you",
+        "phone number",
+        "email",
+        "how to reach you"
+      ]
+    },
+    "company_info": {
+      "confirmed": false,
+      "answer": "UNCONFIRMED — general company information not yet provided by the LionCity team.",
+      "aliases": [
+        "company info",
+        "company information",
+        "about",
+        "about you",
+        "who are you",
+        "what do you do"
+      ]
+    }
+  }
+}

@@ -133,6 +133,32 @@ def create_tables():
         )
     """)
 
+    # HAFIZAH: UPGRADE EXISTING APPROVAL_REQUESTS TABLE
+    # Existing deployments may already have approval_requests
+    # without the commercial authority fields.
+    cursor.execute("""
+        PRAGMA table_info(approval_requests)
+    """)
+
+    existing_columns = {
+        row["name"]
+        for row in cursor.fetchall()
+    }
+
+    approval_columns = {
+        "sku": "TEXT",
+        "requested_quantity": "INTEGER",
+        "order_value": "REAL",
+        "reason": "TEXT",
+    }
+
+    for column_name, column_type in approval_columns.items():
+        if column_name not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE approval_requests "
+                f"ADD COLUMN {column_name} {column_type}"
+            )
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_messages (
             message_id TEXT PRIMARY KEY,
