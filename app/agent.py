@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import date
 
 from app.claude_client import get_claude_client
@@ -16,7 +17,11 @@ from app.tools.order_creation import create_order
 from app.enquiry_state import EnquiryState
 from app import triage
 from app.tools.faq import lookup_faq
-from app.tools.products import find_product, STATUS_UNIQUE_MATCH as PRODUCT_UNIQUE_MATCH
+from app.tools.products import (
+    find_product,
+    list_catalogue,
+    STATUS_UNIQUE_MATCH as PRODUCT_UNIQUE_MATCH,
+)
 from app.handoff import record_handoff
 from app.quotation import generate_quotation_preview
 
@@ -389,6 +394,25 @@ TOOLS = [
     },
 
     {
+        "name": "list_products",
+        "description": (
+            "List the products LionCity actually sells, for a broad catalogue "
+            "enquiry such as 'what products do you sell?', 'what do you "
+            "carry?', or 'show me your products'. Returns the trusted product "
+            "catalogue (SKU and product name). Base your answer ONLY on what "
+            "this returns - do NOT add product types or categories that are "
+            "not in the result, and do NOT quote stock levels. For a question "
+            "about a SPECIFIC product's availability, use find_product then "
+            "check_inventory instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+
+    {
         "name": "request_human_handoff",
         "description": (
             "Record that the customer explicitly wants to speak to a person "
@@ -484,6 +508,16 @@ DELIVERY
   returned that alternative date as available.
 - If no verified alternative is available, ask the customer for
   another preferred date.
+- Only state a delivery fee if check_delivery actually returned a
+  delivery_fee for an AVAILABLE slot. If delivery is unavailable, or
+  no slot exists, or no delivery_fee was returned, the delivery fee is
+  UNKNOWN. Never assume it is zero, never invent it, and never carry
+  over a fee from a different date/area.
+- When the delivery fee is unknown, do NOT state or calculate a
+  delivered/final total, and do NOT add the product subtotal to any
+  delivery amount. You may still state the product subtotal on its own,
+  but make clear the delivery fee and delivered total cannot be
+  confirmed for that delivery request.
 
 WHATSAPP RESPONSE STYLE
 - Responses are sent through WhatsApp.
@@ -569,8 +603,14 @@ GENERAL QUESTIONS (FAQ)
   date/area) - use the proper business tools for those.
 
 PRODUCTS
-- When the customer names a product, use find_product before checking
-  stock, quoting a price, or creating an order.
+- For a BROAD catalogue question ("what products do you sell?", "what
+  do you carry?", "show me your products"), use list_products and base
+  your answer ONLY on the catalogue it returns. Do NOT list product
+  types or categories (e.g. "safety equipment", "packaging materials")
+  that were not in the returned catalogue, and do NOT state stock
+  quantities.
+- When the customer names a SPECIFIC product, use find_product before
+  checking stock, quoting a price, or creating an order.
 - If exactly one product matches, use that verified product.
 - If several match, ask one concise question to find out which one.
   Do not guess, and do not check stock or price for an arbitrary guess.
@@ -798,6 +838,23 @@ class SalesAgent:
             # do NOT trigger downstream inventory/pricing here.
             return result
 
+        if tool_name == "list_products":
+            # Trusted broad catalogue (customer-safe: sku + product_name only,
+            # no category, no stock, no price). Sourced from the authoritative
+            # products table via app/tools/products.py - not a hard-coded list.
+            # The agent must ground its answer ONLY in this result.
+            return list_catalogue()
+
+        if tool_name == "check_delivery":
+            # DETERMINISTIC DELIVERY GROUNDING (Python-enforced, not
+            # prompt-only). Run the trusted tool, then normalise the result so
+            # a delivery fee is marked verified ONLY when the slot is available
+            # AND a real numeric fee was returned. An unverified/unavailable
+            # result carries NO usable fee and cannot become 0. We also record
+            # a per-turn signal used by the final-response safety guard.
+            result = execute_tool(tool_name, tool_input)
+            return self._normalise_delivery_result(result)
+
         if tool_name == "request_human_handoff":
             # Explicit, score-independent handoff. Works regardless of the
             # triage band. Persistence lives in app/handoff.py (sales_events),
@@ -824,6 +881,109 @@ class SalesAgent:
         self._ingest_tool_side_effects(tool_name, result)
 
         return result
+
+    def _normalise_delivery_result(self, result):
+        """
+        Deterministically ground a check_delivery result before it reaches
+        Claude, and record a per-turn trusted signal.
+
+        A delivery fee is VERIFIED only when the slot is available AND the
+        tool returned a real numeric fee (bool is rejected - it is a subclass
+        of int). Otherwise the fee is UNKNOWN: we strip any fee value and flag
+        the result so no delivered/final total can be trusted. This never
+        invents or defaults a fee to 0.
+        """
+        if not isinstance(result, dict):
+            self._delivery_fee_verified_this_turn = False
+            return result
+
+        fee = result.get("delivery_fee")
+        fee_is_number = isinstance(fee, (int, float)) and not isinstance(fee, bool)
+        verified = result.get("available") is True and fee_is_number
+
+        result["delivery_fee_verified"] = verified
+        result["delivered_total_available"] = verified
+
+        if not verified:
+            # Ensure there is no usable fee presented as trusted.
+            result.pop("delivery_fee", None)
+
+        # Per-turn signal: True/False for the latest delivery check this turn.
+        self._delivery_fee_verified_this_turn = verified
+        return result
+
+    def _guard_delivery_grounding(self, final_text):
+        """
+        Deterministic final-response safety layer for delivery grounding.
+
+        Narrowly scoped: it only acts when THIS turn performed a delivery check
+        whose fee was NOT verified (unavailable / no slot / no numeric fee). In
+        that case, if the drafted reply makes a delivery-linked total or
+        free-delivery claim, we replace it with a safe fallback (preserving any
+        stated product subtotal). It does not touch replies when delivery was
+        verified or when no delivery check happened this turn, and it does not
+        block a bare product subtotal.
+        """
+        # Only relevant when this turn had an UNVERIFIED delivery check.
+        if getattr(self, "_delivery_fee_verified_this_turn", None) is not False:
+            return final_text
+
+        lowered = final_text.lower()
+
+        # Narrow set of delivery-linked total / free-delivery claim markers.
+        violation_markers = [
+            "delivered total",
+            "final delivered total",
+            "final total",
+            "total delivered",
+            "free delivery",
+            "delivery is free",
+            "delivery: free",
+            "delivery fee is $0",
+            "delivery fee of $0",
+            "no delivery fee",
+            "delivery is included",
+            "delivery included",
+        ]
+        # Also catch "total incl(uding) delivery" phrasing.
+        includes_delivery_total = (
+            "total" in lowered and "delivery" in lowered
+            and ("incl" in lowered or "with delivery" in lowered
+                 or "including delivery" in lowered)
+        )
+        has_violation = includes_delivery_total or any(
+            m in lowered for m in violation_markers
+        )
+
+        if not has_violation:
+            return final_text
+
+        # Preserve a stated product subtotal if present (e.g. "product
+        # subtotal is S$1,200" / "subtotal: SGD 1200").
+        subtotal_phrase = ""
+        match = re.search(
+            r"(?:product\s+)?subtotal[^.\n]*?"
+            r"(?:S\$|SGD\s*|\$)\s*[\d,]+(?:\.\d{1,2})?",
+            final_text, flags=re.IGNORECASE,
+        )
+        if match:
+            subtotal_phrase = "The product subtotal is " + re.sub(
+                r".*?((?:S\$|SGD\s*|\$)\s*[\d,]+(?:\.\d{1,2})?).*",
+                r"\1", match.group(0), flags=re.IGNORECASE | re.DOTALL,
+            ).strip() + ". "
+
+        safe = (
+            subtotal_phrase
+            + "There isn't an available delivery slot for that delivery "
+            "request, so I can't confirm a delivery fee or delivered total "
+            "at this time."
+        )
+        self.log_activity(
+            "delivery_grounding_guard",
+            "Replaced an unverified delivery total/free-delivery claim.",
+            {"original": final_text},
+        )
+        return safe
 
     def _create_handoff(self, trigger, reason):
         """
@@ -962,6 +1122,11 @@ class SalesAgent:
             customer_message
         )
 
+        # Reset the per-turn delivery-verification signal so a verified fee
+        # from an EARLIER turn can never authorise or leak into THIS turn's
+        # response. None = no delivery check yet this turn.
+        self._delivery_fee_verified_this_turn = None
+
         # ---------------------------------------------
         # Add this NEW customer message to the existing
         # conversation history.
@@ -1022,6 +1187,13 @@ class SalesAgent:
                 final_text = "\n".join(
                     final_text_parts
                 )
+
+                # DETERMINISTIC DELIVERY-GROUNDING SAFETY LAYER.
+                # If this turn had an unverified/unavailable delivery check,
+                # block any delivery-linked total / free-delivery claim in the
+                # drafted reply (does not touch a bare product subtotal, nor
+                # verified-delivery turns).
+                final_text = self._guard_delivery_grounding(final_text)
 
                 # IMPORTANT:
                 # Store Claude's final reply in memory.
