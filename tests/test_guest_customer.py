@@ -333,16 +333,28 @@ def test_high_priority_no_order_or_discount_side_effect(make_agent, monkeypatch)
 # 24. Existing discount HITL path/config remains unchanged
 # ----------------------------------------------------------------------
 
-def test_discount_hitl_untouched():
-    # AI discount authority still owned by tools/discount.py, unchanged.
-    from app.tools.discount import AI_DISCOUNT_LIMIT, check_discount_authority
-    assert AI_DISCOUNT_LIMIT == 5.0
+def test_discount_hitl_untouched(monkeypatch):
+    # AI discount authority is still owned by tools/discount.py, but PR #2
+    # made the limit a DB-backed commercial policy (MAX_DISCOUNT_PERCENT)
+    # instead of the old module constant AI_DISCOUNT_LIMIT. Provide the
+    # policy state via the lookup the code actually uses (no runtime-DB
+    # mutation) and assert the real authority DECISION is unchanged: at/under
+    # the limit needs no human approval; over the limit does.
+    from app.tools.discount import check_discount_authority
+
+    monkeypatch.setattr(
+        "app.tools.discount.get_commercial_policies",
+        lambda: [{"policy_key": "MAX_DISCOUNT_PERCENT", "policy_value": 5,
+                  "description": "test"}],
+    )
 
     within = check_discount_authority(5)
     assert within["requires_human_approval"] is False
+    assert within["ai_authority_limit_percent"] == 5
 
     over = check_discount_authority(10)
     assert over["requires_human_approval"] is True
+    assert over["ai_authority_limit_percent"] == 5
 
 
 # ----------------------------------------------------------------------

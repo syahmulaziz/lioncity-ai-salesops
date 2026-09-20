@@ -10,7 +10,7 @@ We do NOT test a live model's intelligence.
 
 import pytest
 
-from tests._agent_harness import build_agent
+from tests._agent_harness import build_agent, patch_commercial_policies
 from app.triage_config import (
     BAND_ROUTINE,
     BAND_SALES_OPPORTUNITY,
@@ -256,6 +256,10 @@ def test_scenario_h_explicit_human(monkeypatch):
 # ======================================================================
 
 def test_scenario_i_discount(monkeypatch):
+    # PR #2 resolves the AI discount limit from commercial policy
+    # (MAX_DISCOUNT_PERCENT = 5); provide it to the real authority path
+    # without touching the runtime DB. 10% > 5% -> genuine HITL.
+    patch_commercial_policies(monkeypatch)
     script = [
         [("check_discount_authority", {"requested_discount_percent": 10})],
         "I've sent that request for review.",
@@ -265,6 +269,7 @@ def test_scenario_i_discount(monkeypatch):
     assert "check_discount_authority" in tools
     assert agent.pending_approval is not None                 # HITL intact
     assert agent.pending_approval["requested_discount_percent"] == 10
+    assert agent.pending_approval["ai_authority_limit_percent"] == 5
 
 
 # ======================================================================

@@ -244,3 +244,82 @@ def test_check_delivery_unavailable_shape_direct():
     assert result["available"] is False
     assert result.get("reason") == "NO_DELIVERY_SLOT"
     assert "delivery_fee" not in result
+
+
+
+# ======================================================================
+# 9. CONVERSATION-HISTORY grounding: the STORED final assistant message
+#    must equal the GUARDED customer-facing reply (not the raw model text).
+#
+#    Regression for the defect where the guarded text was returned to the
+#    customer but the UNGUARDED response.content was appended to
+#    self.messages, letting an unsupported delivery amount re-enter context
+#    on later turns.
+# ======================================================================
+
+def _last_assistant_text(agent):
+    """Flatten the final stored assistant message to plain text."""
+    for m in reversed(agent.messages):
+        if m["role"] != "assistant":
+            continue
+        content = m["content"]
+        if isinstance(content, str):
+            return content
+        # tool_use turns store a list of blocks; join any text blocks.
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif getattr(b, "type", None) == "text":
+                parts.append(getattr(b, "text", ""))
+        return "\n".join(parts)
+    return None
+
+
+def test_stored_history_equals_guarded_reply_when_blocked(monkeypatch):
+    # Hostile LLM emits an unverified delivered total after an unavailable
+    # delivery check. The guard neutralises the customer reply; the STORED
+    # history entry must match that guarded reply, NOT the raw unsafe text.
+    script = [
+        [("check_delivery", {"delivery_area": "Nowhere-Zone",
+                             "delivery_date": "2099-01-01"})],
+        "There is no delivery slot, but your final delivered total is S$1,200.",
+    ]
+    agent, tools = build_agent(monkeypatch, script)
+    result = agent.send("Deliver 100 cables to Nowhere-Zone on 2099-01-01?")
+    reply = result["response"]
+
+    # (1) Customer-facing response lacks the unsafe amount.
+    assert "1,200" not in reply and "1200" not in reply
+
+    # (2) The STORED final assistant history entry also lacks the amount.
+    stored = _last_assistant_text(agent)
+    assert stored is not None
+    assert "1,200" not in stored and "1200" not in stored
+
+    # (3) Stored history == the guarded response the customer saw.
+    assert stored == reply
+
+    # Guard fired.
+    assert any(e["type"] == "delivery_grounding_guard" for e in agent.activity_log)
+
+
+def test_stored_history_matches_reply_when_verified(monkeypatch):
+    # Positive control: on a verified-delivery turn the guard does NOT alter
+    # the reply, and the stored history still equals the returned reply.
+    script = [
+        [("check_delivery", {"delivery_area": AVAIL_AREA,
+                             "delivery_date": AVAIL_DATE})],
+        f"Delivery to {AVAIL_AREA} on {AVAIL_DATE} is S${AVAIL_FEE:.0f}. "
+        "Your delivered total is S$1,235.",
+    ]
+    agent, tools = build_agent(monkeypatch, script)
+    result = agent.send(f"Deliver to {AVAIL_AREA} on {AVAIL_DATE}?")
+    reply = result["response"]
+
+    stored = _last_assistant_text(agent)
+    assert stored is not None
+    assert stored == reply
+    # Verified amount preserved in both the reply and stored history.
+    assert "1,235" in reply
+    assert "1,235" in stored

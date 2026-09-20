@@ -1342,10 +1342,15 @@ class SalesAgent:
                 final_text = self._guard_delivery_grounding(final_text)
 
                 # IMPORTANT:
-                # Store Claude's final reply in memory.
+                # Store the GUARDED customer-facing reply in memory, not the
+                # raw model content. On a final (non-tool-use) turn there are
+                # no tool_use blocks to preserve, so storing the guarded text
+                # keeps conversation history consistent with what the customer
+                # actually saw and prevents an unsupported delivery claim from
+                # re-entering context on later turns.
                 self.messages.append({
                     "role": "assistant",
-                    "content": response.content
+                    "content": final_text
                 })
 
                 self.log_activity(
