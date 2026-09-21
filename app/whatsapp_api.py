@@ -780,7 +780,12 @@ def process_approvals():
         )
 
         print(
-            "Approved discount:",
+            "Approval type:",
+            approval.get("approval_type")
+        )
+
+        print(
+            "Approved percent:",
             approved_percent
         )
 
@@ -836,6 +841,8 @@ def process_approvals():
             skipped.append({
                 "approval_id": approval_id,
                 "reason": "AGENT_REJECTED_APPROVAL",
+                "approval_type": approval_type,
+                "agent_result": result,
             })
 
             continue
