@@ -1,5 +1,5 @@
 import json
-import re
+import math
 from datetime import date
 
 from app.claude_client import get_claude_client
@@ -22,7 +22,10 @@ from app.database import (
 # Person 1 sales-triage enhancement (structured enquiry state + triage).
 from app.enquiry_state import EnquiryState
 from app import triage
-from app.tools.faq import lookup_faq
+from app.tools.faq import (
+    lookup_faq,
+    STATUS_FOUND_CONFIRMED as STATUS_FAQ_FOUND_CONFIRMED,
+)
 from app.tools.products import (
     find_product,
     list_catalogue,
@@ -934,6 +937,47 @@ class SalesAgent:
         # Human-in-the-loop state
         self.pending_approval = None
 
+        # RESPONSE-CYCLE GROUNDING STATE (Person 1 grounding fixes).
+        #
+        # These hold the TRUSTED result of the most recent check_delivery /
+        # list_products call made THIS response cycle (one send() call, or
+        # one approval-continuation call). They are the single source of
+        # truth the shared response finalizer uses to deterministically
+        # render delivery/catalogue facts - never text parsed from Claude's
+        # draft. `_delivery_fee_verified_this_turn` is kept only for
+        # backwards compatibility with existing call sites/tests that read
+        # it directly; the finalizer relies on the full snapshot instead.
+        self._reset_response_grounding()
+
+    def _reset_response_grounding(self):
+        """
+        Clear per-response-cycle trusted grounding state.
+
+        Call this at the START of a new customer turn (send()) and again
+        immediately before beginning a fresh approval continuation - never
+        in the middle of a recursive tool-use loop, so a delivery/catalogue
+        result obtained earlier in the SAME cycle remains available to the
+        finalizer once Claude produces its final text.
+        """
+        self._delivery_fee_verified_this_turn = None
+        self._delivery_result_this_cycle = None
+        self._catalogue_result_this_cycle = None
+
+        # MULTI-INTENT SAFETY (pre-commit review follow-up).
+        #
+        # These hold the TRUSTED result of the most recent
+        # generate_quotation_preview / lookup_faq / find_product (only on a
+        # UNIQUE match) / request_human_handoff call made THIS response
+        # cycle. They exist ONLY so the finalizer can restore a LEGITIMATE
+        # secondary intent's trusted info when a catalogue/delivery section
+        # is also being rendered this cycle (which otherwise discards
+        # Claude's entire draft, silently dropping any other intent it
+        # covered). None = that tool did not run this response cycle.
+        self._quotation_result_this_cycle = None
+        self._faq_result_this_cycle = None
+        self._specific_product_result_this_cycle = None
+        self._handoff_result_this_cycle = None
+
     def log_activity(
         self,
         activity_type: str,
@@ -986,7 +1030,16 @@ class SalesAgent:
         if tool_name == "lookup_faq":
             # Trusted static FAQ provider (Batch 2). Matching/content live in
             # app/tools/faq.py + app/data/faq.json - not duplicated here.
-            return lookup_faq(query=(tool_input or {}).get("query", ""))
+            #
+            # MULTI-INTENT SAFETY: retain the trusted result for THIS
+            # response cycle so the finalizer can restore a legitimate FAQ
+            # answer if a catalogue/delivery section is also rendered this
+            # cycle. Only ever the CONFIRMED contract fields are kept -
+            # never the withheld placeholder text.
+            result = lookup_faq(query=(tool_input or {}).get("query", ""))
+            if isinstance(result, dict):
+                self._faq_result_this_cycle = result
+            return result
 
         if tool_name == "find_product":
             # Trusted product discovery (Batch 2). On a UNIQUE match we ingest
@@ -998,6 +1051,16 @@ class SalesAgent:
                     {"success": True, **result["product"]}
                 )
                 self._evaluate_triage()
+                # MULTI-INTENT SAFETY: retain ONLY the trusted sku/product_name
+                # for THIS response cycle (never category/stock/price - those
+                # remain unrequested customer-facing facts), so the finalizer
+                # can restore a legitimate specific-product answer if a
+                # catalogue/delivery section is also rendered this cycle.
+                product = result.get("product") or {}
+                self._specific_product_result_this_cycle = {
+                    "sku": product.get("sku"),
+                    "product_name": product.get("product_name"),
+                }
             # MULTIPLE_MATCHES / NO_MATCH: deliberately do NOT set any SKU and
             # do NOT trigger downstream inventory/pricing here.
             return result
@@ -1007,7 +1070,25 @@ class SalesAgent:
             # no category, no stock, no price). Sourced from the authoritative
             # products table via app/tools/products.py - not a hard-coded list.
             # The agent must ground its answer ONLY in this result.
-            return list_catalogue()
+            #
+            # GROUNDING: retain a safe copy for THIS response cycle so the
+            # shared finalizer can render the broad-catalogue reply directly
+            # from trusted data instead of Claude's free-form draft text.
+            result = list_catalogue()
+            if isinstance(result, dict) and result.get("success"):
+                self._catalogue_result_this_cycle = {
+                    "success": True,
+                    "count": result.get("count"),
+                    "products": [
+                        {
+                            "sku": p.get("sku"),
+                            "product_name": p.get("product_name"),
+                        }
+                        for p in (result.get("products") or [])
+                        if isinstance(p, dict)
+                    ],
+                }
+            return result
 
         if tool_name == "check_delivery":
             # DETERMINISTIC DELIVERY GROUNDING (Python-enforced, not
@@ -1015,9 +1096,51 @@ class SalesAgent:
             # a delivery fee is marked verified ONLY when the slot is available
             # AND a real numeric fee was returned. An unverified/unavailable
             # result carries NO usable fee and cannot become 0. We also record
-            # a per-turn signal used by the final-response safety guard.
-            result = execute_tool(tool_name, tool_input)
-            return self._normalise_delivery_result(result)
+            # a per-turn signal used by the final-response safety guard, and
+            # retain the full normalised result for THIS response cycle so the
+            # shared finalizer can bind the reply to the EXACT checked
+            # area/date/availability/fee rather than trust Claude's draft.
+            #
+            # A tool-execution failure still marks this cycle as having an
+            # unverified delivery attempt (never silently "no check happened"),
+            # so the finalizer stays safe even if the underlying tool raises.
+            requested_area = (
+                tool_input.get("delivery_area")
+                if isinstance(tool_input, dict) else None
+            )
+            requested_date = (
+                tool_input.get("delivery_date")
+                if isinstance(tool_input, dict) else None
+            )
+            try:
+                result = execute_tool(tool_name, tool_input)
+                normalised = self._normalise_delivery_result(result)
+            except Exception as error:
+                self._delivery_fee_verified_this_turn = False
+                self._delivery_result_this_cycle = {
+                    "success": False,
+                    "delivery_area": requested_area,
+                    "delivery_date": requested_date,
+                    "available": False,
+                    "delivery_fee_verified": False,
+                }
+                return {
+                    "success": False,
+                    "error": "TOOL_EXECUTION_ERROR",
+                    "message": str(error),
+                }
+
+            self._delivery_result_this_cycle = (
+                normalised if isinstance(normalised, dict) else
+                {
+                    "success": False,
+                    "delivery_area": requested_area,
+                    "delivery_date": requested_date,
+                    "available": False,
+                    "delivery_fee_verified": False,
+                }
+            )
+            return normalised
 
         if tool_name == "request_human_handoff":
             # Explicit, score-independent handoff. Works regardless of the
@@ -1027,16 +1150,34 @@ class SalesAgent:
             reason = (tool_input or {}).get(
                 "reason", "customer asked for a salesperson"
             )
-            return self._create_handoff(
+            result = self._create_handoff(
                 trigger="explicit_request", reason=reason
             )
+            # MULTI-INTENT SAFETY: retain the trusted RECORDED/ERROR result
+            # for THIS response cycle so the finalizer can append a
+            # deterministic acknowledgement if a catalogue/delivery section
+            # is also rendered this cycle. Whether a human was actually
+            # notified is decided from THIS result only, never from Claude's
+            # wording.
+            if isinstance(result, dict):
+                self._handoff_result_this_cycle = result
+            return result
 
         if tool_name == "generate_quotation_preview":
             # Non-final quotation PREVIEW built ONLY from current trusted
             # enquiry state (verified product / quantity / verified_subtotal).
             # The builder lives in app/quotation.py; nothing is invented here
             # and no value is taken from customer/LLM text.
-            return generate_quotation_preview(self.enquiry)
+            #
+            # MULTI-INTENT SAFETY: retain the trusted preview (specifically
+            # its pre-formatted, WhatsApp-safe "message") for THIS response
+            # cycle so the finalizer can restore it if a catalogue/delivery
+            # section is also rendered this cycle, instead of reconstructing
+            # any monetary value from Claude's draft text.
+            result = generate_quotation_preview(self.enquiry)
+            if isinstance(result, dict):
+                self._quotation_result_this_cycle = result
+            return result
 
         # TRUSTED PATH: run the existing business tool unchanged.
         result = execute_tool(tool_name, tool_input)
@@ -1052,10 +1193,11 @@ class SalesAgent:
         Claude, and record a per-turn trusted signal.
 
         A delivery fee is VERIFIED only when the slot is available AND the
-        tool returned a real numeric fee (bool is rejected - it is a subclass
-        of int). Otherwise the fee is UNKNOWN: we strip any fee value and flag
-        the result so no delivered/final total can be trusted. This never
-        invents or defaults a fee to 0.
+        tool returned a real, finite, nonnegative numeric fee (bool is
+        rejected - it is a subclass of int; NaN/inf/negative are rejected too).
+        Otherwise the fee is UNKNOWN: we strip any fee value and flag the
+        result so no delivered/final total can be trusted. This never invents
+        or defaults a fee to 0.
         """
         if not isinstance(result, dict):
             self._delivery_fee_verified_this_turn = False
@@ -1063,7 +1205,12 @@ class SalesAgent:
 
         fee = result.get("delivery_fee")
         fee_is_number = isinstance(fee, (int, float)) and not isinstance(fee, bool)
-        verified = result.get("available") is True and fee_is_number
+        fee_is_safe = (
+            fee_is_number
+            and math.isfinite(fee)
+            and fee >= 0
+        )
+        verified = result.get("available") is True and fee_is_safe
 
         result["delivery_fee_verified"] = verified
         result["delivered_total_available"] = verified
@@ -1076,78 +1223,291 @@ class SalesAgent:
         self._delivery_fee_verified_this_turn = verified
         return result
 
-    def _guard_delivery_grounding(self, final_text):
+    def _trusted_subtotal_line(self):
         """
-        Deterministic final-response safety layer for delivery grounding.
-
-        Narrowly scoped: it only acts when THIS turn performed a delivery check
-        whose fee was NOT verified (unavailable / no slot / no numeric fee). In
-        that case, if the drafted reply makes a delivery-linked total or
-        free-delivery claim, we replace it with a safe fallback (preserving any
-        stated product subtotal). It does not touch replies when delivery was
-        verified or when no delivery check happened this turn, and it does not
-        block a bare product subtotal.
+        Return a canonical "product subtotal" line built ONLY from the
+        trusted `EnquiryState.verified_subtotal` - NEVER from Claude's draft
+        text. Returns "" when no valid trusted subtotal exists (never
+        preserves/invents a customer- or model-authored amount).
         """
-        # Only relevant when this turn had an UNVERIFIED delivery check.
-        if getattr(self, "_delivery_fee_verified_this_turn", None) is not False:
-            return final_text
+        subtotal = self.enquiry.verified_subtotal
+        is_number = isinstance(subtotal, (int, float)) and not isinstance(
+            subtotal, bool
+        )
+        if not is_number or not math.isfinite(subtotal) or subtotal < 0:
+            return ""
+        return f"The product subtotal is S${subtotal:,.2f}."
 
-        lowered = final_text.lower()
+    def _render_delivery_section(self):
+        """
+        Deterministically render the delivery portion of the final response
+        from the TRUSTED `_delivery_result_this_cycle` snapshot only - never
+        from Claude's draft text. Returns "" when no delivery check ran this
+        response cycle (delivery wording is left entirely to the draft).
 
-        # Narrow set of delivery-linked total / free-delivery claim markers.
-        violation_markers = [
-            "delivered total",
-            "final delivered total",
-            "final total",
-            "total delivered",
-            "free delivery",
-            "delivery is free",
-            "delivery: free",
-            "delivery fee is $0",
-            "delivery fee of $0",
-            "no delivery fee",
-            "delivery is included",
-            "delivery included",
+        This binds the customer-facing area/date/fee to the EXACT trusted
+        checked tuple (fixes: model stating a different date/area, and a
+        standalone unverified fee claim surviving an unavailable/failed
+        check), and never lets an unverified fee become a delivered/final
+        total.
+        """
+        snapshot = self._delivery_result_this_cycle
+        if snapshot is None:
+            return ""
+
+        subtotal_line = self._trusted_subtotal_line()
+
+        if not isinstance(snapshot, dict) or not snapshot.get("success"):
+            lines = [
+                "I couldn't verify delivery availability, the delivery fee, "
+                "or a delivered total for that request."
+            ]
+            if subtotal_line:
+                lines.insert(0, subtotal_line)
+            return " ".join(lines)
+
+        area = snapshot.get("delivery_area")
+        checked_date = snapshot.get("delivery_date")
+        location = f"{area} on {checked_date}" if area and checked_date else (
+            area or checked_date or "that request"
+        )
+
+        if snapshot.get("available") is not True:
+            lines = [
+                f"Delivery to {location} is unavailable.",
+                "I can't confirm a delivery fee or delivered total for "
+                "that request.",
+            ]
+            if subtotal_line:
+                lines.insert(0, subtotal_line)
+            return " ".join(lines)
+
+        if snapshot.get("delivery_fee_verified") is True:
+            fee = snapshot.get("delivery_fee")
+            lines = [
+                f"Delivery to {location} is available.",
+                f"Verified delivery fee: S${fee:,.2f}.",
+            ]
+            if subtotal_line:
+                lines.insert(0, subtotal_line)
+            return " ".join(lines)
+
+        # Available, but fee could not be verified (e.g. non-numeric,
+        # negative, or missing fee from the tool). Never assume S$0.
+        lines = [
+            f"Delivery to {location} is available.",
+            "I can't confirm the delivery fee or delivered total yet.",
         ]
-        # Also catch "total incl(uding) delivery" phrasing.
-        includes_delivery_total = (
-            "total" in lowered and "delivery" in lowered
-            and ("incl" in lowered or "with delivery" in lowered
-                 or "including delivery" in lowered)
-        )
-        has_violation = includes_delivery_total or any(
-            m in lowered for m in violation_markers
+        if subtotal_line:
+            lines.insert(0, subtotal_line)
+        return " ".join(lines)
+
+    def _render_catalogue_section(self):
+        """
+        Deterministically render the broad-catalogue portion of the final
+        response from the TRUSTED `_catalogue_result_this_cycle` snapshot
+        only - never from Claude's draft text. Returns "" when the broad
+        catalogue tool did not run this response cycle (a specific-product
+        lookup via find_product/check_inventory never sets this snapshot, so
+        it never activates this renderer).
+
+        Only the trusted sku/product_name pairs actually returned may appear;
+        Claude cannot add products, categories, stock levels or prices.
+        """
+        snapshot = self._catalogue_result_this_cycle
+        if snapshot is None:
+            return ""
+
+        products = snapshot.get("products") if isinstance(snapshot, dict) else None
+        if not snapshot.get("success") or not products:
+            return "I can't confirm our current product catalogue right now."
+
+        lines = ["Here are the products currently listed in our catalogue:"]
+        for product in products:
+            sku = product.get("sku")
+            name = product.get("product_name")
+            if sku and name:
+                lines.append(f"- {sku} — {name}")
+        return "\n".join(lines)
+
+    def _render_quotation_section(self):
+        """
+        Deterministically render the quotation-preview portion of the final
+        response from the TRUSTED `_quotation_result_this_cycle` snapshot
+        only - never from Claude's draft text. Returns "" when
+        generate_quotation_preview did not run this response cycle.
+
+        Reuses the SAME pre-formatted "message" string app/quotation.py
+        already builds from trusted state (no monetary value is
+        reconstructed here or taken from Claude's prose).
+        """
+        snapshot = self._quotation_result_this_cycle
+        if not isinstance(snapshot, dict) or not snapshot.get("success"):
+            return ""
+        return snapshot.get("message") or ""
+
+    def _render_faq_section(self):
+        """
+        Deterministically render the FAQ portion of the final response from
+        the TRUSTED `_faq_result_this_cycle` snapshot only - never from
+        Claude's draft text. Returns "" when lookup_faq did not run this
+        response cycle, OR when the topic was NOT_FOUND (nothing safe to
+        say beyond the draft), OR when it was FOUND_UNCONFIRMED (the
+        placeholder value must never be surfaced as fact - safe withholding
+        is preserved by rendering nothing here).
+        """
+        snapshot = self._faq_result_this_cycle
+        if not isinstance(snapshot, dict):
+            return ""
+        if snapshot.get("status") == STATUS_FAQ_FOUND_CONFIRMED and snapshot.get(
+            "success"
+        ):
+            answer = snapshot.get("answer")
+            if answer:
+                return str(answer)
+        return ""
+
+    def _render_specific_product_section(self):
+        """
+        Deterministically render the specific-product portion of the final
+        response from the TRUSTED `_specific_product_result_this_cycle`
+        snapshot only - never from Claude's draft text. Returns "" when
+        find_product did not resolve a UNIQUE match this response cycle.
+
+        Only the trusted sku/product_name pair is shown - never category,
+        stock, or price, which were never requested by this renderer's
+        trigger (a specific-product lookup, not an inventory/pricing call).
+        """
+        snapshot = self._specific_product_result_this_cycle
+        if not isinstance(snapshot, dict):
+            return ""
+        sku = snapshot.get("sku")
+        name = snapshot.get("product_name")
+        if sku and name:
+            return f"That matches {name} ({sku}) in our catalogue."
+        return ""
+
+    def _render_handoff_section(self):
+        """
+        Deterministically render the human-handoff acknowledgement portion
+        of the final response from the TRUSTED `_handoff_result_this_cycle`
+        snapshot only - never from Claude's draft text. Returns "" when
+        request_human_handoff did not run this response cycle.
+
+        Whether a human follow-up may be promised is decided ONLY from the
+        trusted RECORDED/ERROR result: on RECORDED we may say a follow-up
+        was requested; on a failure we must NOT claim a salesperson was
+        notified.
+        """
+        snapshot = self._handoff_result_this_cycle
+        if not isinstance(snapshot, dict):
+            return ""
+        if snapshot.get("success") and snapshot.get("status") == "RECORDED":
+            return (
+                "I've flagged this for our sales team - a salesperson will "
+                "follow up with you."
+            )
+        return (
+            "I wasn't able to confirm that a salesperson has been notified "
+            "- please try again or contact us directly."
         )
 
-        if not has_violation:
-            return final_text
+    def _finalize_customer_response(self, response_content):
+        """
+        SINGLE shared customer-response finalizer.
 
-        # Preserve a stated product subtotal if present (e.g. "product
-        # subtotal is S$1,200" / "subtotal: SGD 1200").
-        subtotal_phrase = ""
-        match = re.search(
-            r"(?:product\s+)?subtotal[^.\n]*?"
-            r"(?:S\$|SGD\s*|\$)\s*[\d,]+(?:\.\d{1,2})?",
-            final_text, flags=re.IGNORECASE,
-        )
-        if match:
-            subtotal_phrase = "The product subtotal is " + re.sub(
-                r".*?((?:S\$|SGD\s*|\$)\s*[\d,]+(?:\.\d{1,2})?).*",
-                r"\1", match.group(0), flags=re.IGNORECASE | re.DOTALL,
-            ).strip() + ". "
+        Used by BOTH the normal send() loop and the terminal response of
+        _continue_after_human_action() (which itself backs both the legacy
+        discount apply_human_approval() and the newer
+        apply_commercial_authority_approval() continuation entry points), so
+        every path that can produce a customer-facing reply applies the
+        SAME deterministic grounding and stores EXACTLY what it returns.
 
-        safe = (
-            subtotal_phrase
-            + "There isn't an available delivery slot for that delivery "
-            "request, so I can't confirm a delivery fee or delivered total "
-            "at this time."
-        )
+        Behaviour:
+          - If this response cycle ran the broad catalogue tool and/or an
+            exact-date delivery check, the corresponding section(s) are
+            rendered deterministically from trusted state (catalogue first,
+            then delivery) and Claude's own wording for those facts is
+            discarded.
+          - MULTI-INTENT SAFETY: whenever a catalogue/delivery section is
+            being rendered, any OTHER trusted secondary-intent section
+            (quotation preview, FAQ, specific-product, human-handoff
+            acknowledgement) that also applies THIS cycle is APPENDED after
+            it - each rendered independently from its own trusted snapshot,
+            never by re-including Claude's discarded draft. This restores
+            legitimate secondary information (e.g. delivery+quotation,
+            catalogue+FAQ) that the catalogue/delivery grounding would
+            otherwise silently drop.
+          - If NEITHER catalogue nor delivery applies, Claude's draft text
+            is returned unchanged (this patch only grounds delivery/
+            catalogue facts; it does not add a general response filter).
+          - The returned string is ALSO exactly what gets appended to
+            self.messages and exactly what gets logged, so
+            returned_response == stored_assistant_response always holds.
+        """
+        final_text_parts = []
+        for block in response_content:
+            if block.type == "text":
+                final_text_parts.append(block.text)
+        draft_text = "\n".join(final_text_parts)
+
+        catalogue_section = self._render_catalogue_section()
+        delivery_section = self._render_delivery_section()
+
+        if catalogue_section or delivery_section:
+            sections = [s for s in (catalogue_section, delivery_section) if s]
+
+            # Restore any OTHER trusted secondary-intent section that also
+            # applies this cycle (see MULTI-INTENT SAFETY above). Order
+            # matches the order tools are listed in TOOLS; none of these
+            # activate unless their OWN tool actually ran this cycle.
+            secondary_sections = [
+                s
+                for s in (
+                    self._render_quotation_section(),
+                    self._render_faq_section(),
+                    self._render_specific_product_section(),
+                    self._render_handoff_section(),
+                )
+                if s
+            ]
+            sections.extend(secondary_sections)
+
+            final_text = "\n\n".join(sections)
+            if catalogue_section:
+                self.log_activity(
+                    "catalogue_grounding_render",
+                    "Rendered broad catalogue reply from trusted data.",
+                    {"draft": draft_text},
+                )
+            if delivery_section:
+                self.log_activity(
+                    "delivery_grounding_guard",
+                    "Rendered delivery reply from the trusted checked "
+                    "result instead of the model draft.",
+                    {"original": draft_text},
+                )
+            if secondary_sections:
+                self.log_activity(
+                    "multi_intent_secondary_render",
+                    "Restored trusted secondary-intent section(s) alongside "
+                    "the catalogue/delivery grounding.",
+                    {"draft": draft_text, "sections": secondary_sections},
+                )
+        else:
+            final_text = draft_text
+
+        self.messages.append({
+            "role": "assistant",
+            "content": final_text
+        })
+
         self.log_activity(
-            "delivery_grounding_guard",
-            "Replaced an unverified delivery total/free-delivery claim.",
-            {"original": final_text},
+            "agent_response",
+            final_text
         )
-        return safe
+
+        return final_text
 
     def _create_handoff(self, trigger, reason):
         """
@@ -1286,10 +1646,10 @@ class SalesAgent:
             customer_message
         )
 
-        # Reset the per-turn delivery-verification signal so a verified fee
-        # from an EARLIER turn can never authorise or leak into THIS turn's
-        # response. None = no delivery check yet this turn.
-        self._delivery_fee_verified_this_turn = None
+        # Reset response-cycle grounding so a verified delivery/catalogue
+        # result from an EARLIER turn can never authorise or leak into THIS
+        # turn's response. None = no delivery/catalogue lookup yet this turn.
+        self._reset_response_grounding()
 
         # ---------------------------------------------
         # Add this NEW customer message to the existing
@@ -1339,42 +1699,18 @@ class SalesAgent:
 
             if response.stop_reason != "tool_use":
 
-                final_text_parts = []
-
-                for block in response.content:
-
-                    if block.type == "text":
-                        final_text_parts.append(
-                            block.text
-                        )
-
-                final_text = "\n".join(
-                    final_text_parts
-                )
-
-                # DETERMINISTIC DELIVERY-GROUNDING SAFETY LAYER.
-                # If this turn had an unverified/unavailable delivery check,
-                # block any delivery-linked total / free-delivery claim in the
-                # drafted reply (does not touch a bare product subtotal, nor
-                # verified-delivery turns).
-                final_text = self._guard_delivery_grounding(final_text)
-
-                # IMPORTANT:
-                # Store the GUARDED customer-facing reply in memory, not the
-                # raw model content. On a final (non-tool-use) turn there are
-                # no tool_use blocks to preserve, so storing the guarded text
-                # keeps conversation history consistent with what the customer
-                # actually saw and prevents an unsupported delivery claim from
-                # re-entering context on later turns.
-                self.messages.append({
-                    "role": "assistant",
-                    "content": final_text
-                })
-
-                self.log_activity(
-                    "agent_response",
-                    final_text
-                )
+                # SHARED FINALIZER (Person 1 grounding fixes G01-G05).
+                #
+                # On a final (non-tool-use) turn there are no tool_use blocks
+                # to preserve, so the finalizer's returned string is stored
+                # AS-IS as the assistant history entry, keeping conversation
+                # history consistent with what the customer actually saw and
+                # preventing an unsupported delivery/catalogue claim from
+                # re-entering context on later turns. This is the SAME
+                # finalizer used by _continue_after_human_action(), so normal
+                # and human-approval-resumed responses are grounded and
+                # recorded identically.
+                final_text = self._finalize_customer_response(response.content)
 
                 print("\n" + "=" * 60)
                 print("AGENT FINAL RESPONSE")
@@ -1537,6 +1873,12 @@ class SalesAgent:
             )
         })
 
+        # Reset response-cycle grounding ONCE before starting this fresh
+        # approval-continuation cycle (not inside the recursive tool loop),
+        # so a delivery/catalogue result from the PRECEDING customer turn
+        # can never leak into this continuation's response.
+        self._reset_response_grounding()
+
         return self._continue_after_human_action()
 
     def apply_human_approval(
@@ -1615,6 +1957,12 @@ class SalesAgent:
         # Approval has now been consumed.
         self.pending_approval = None
 
+        # Reset response-cycle grounding ONCE before starting this fresh
+        # approval-continuation cycle (not inside the recursive tool loop),
+        # so a delivery/catalogue result from the PRECEDING customer turn
+        # can never leak into this continuation's response.
+        self._reset_response_grounding()
+
         return self._continue_after_human_action()
 
     def _continue_after_human_action(self):
@@ -1678,24 +2026,16 @@ class SalesAgent:
 
             return self._continue_after_human_action()
 
-        final_text_parts = []
-
-        for block in response.content:
-
-            if block.type == "text":
-                final_text_parts.append(block.text)
-
-        final_text = "\n".join(final_text_parts)
-
-        self.messages.append({
-            "role": "assistant",
-            "content": response.content
-        })
-
-        self.log_activity(
-            "agent_response",
-            final_text
-        )
+        # SHARED FINALIZER (Person 1 grounding fixes G01-G05).
+        #
+        # Uses the EXACT SAME finalizer as the normal send() path, so an
+        # approval-resumed response (from either apply_human_approval() or
+        # apply_commercial_authority_approval()) gets identical delivery/
+        # catalogue grounding, and the returned response is stored as
+        # EXACTLY the same string in self.messages (returned_response ==
+        # stored_assistant_response), fixing the history-consistency defect
+        # that previously only applied to the normal send() path.
+        final_text = self._finalize_customer_response(response.content)
 
         print("\n" + "=" * 60)
         print("AGENT AFTER HUMAN APPROVAL")
