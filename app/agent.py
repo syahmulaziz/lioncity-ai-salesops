@@ -17,6 +17,7 @@ from app.tools.order_creation import create_order
 from app.database import (
     get_matching_commercial_approval,
     mark_approval_processed,
+    log_sales_event,
 )
 
 # Person 1 sales-triage enhancement (structured enquiry state + triage).
@@ -877,7 +878,27 @@ def execute_tool(tool_name: str, tool_input: dict):
 
             for approval in matched_approvals:
 
-                mark_approval_processed(approval["approval_id"])
+                mark_approval_processed(
+                    approval["approval_id"]
+                )
+
+        else:
+
+            # The customer accepted the order, but the system
+            # could not persist/create it. Surface this as an
+            # operational event requiring human attention.
+            log_sales_event(
+                event_type="ORDER_CREATION_FAILED",
+                phone=tool_input["phone"],
+                customer_id=tool_input["customer_id"],
+                amount=tool_input["final_total"],
+                details=(
+                    "Order creation failed after customer "
+                    "confirmation. Human follow-up required. "
+                    f"Reason: "
+                    f"{order_result.get('message') or order_result.get('error')}"
+                ),
+            )
 
         return order_result
 

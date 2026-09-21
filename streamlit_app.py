@@ -2348,6 +2348,30 @@ with dashboard_tab:
                             f"S${amount:,.2f}"
                         )
 
+            # =============================================
+            # ORDER CREATION FAILED
+            # =============================================
+            elif event_type == "ORDER_CREATION_FAILED":
+
+                st.error("🚨 ORDER CREATION FAILED — HUMAN ACTION REQUIRED")
+
+                if event.get("customer_id"):
+                    st.write(f"**Customer:** {event['customer_id']}")
+
+                if event.get("phone"):
+                    st.write(f"**Phone:** {event['phone']}")
+
+                if event.get("amount") is not None:
+                    st.write(
+                        f"**Order value:** "
+                        f"S${event['amount']:,.2f}"
+                    )
+
+                if event.get("details"):
+                    st.write(f"**Failure details:** {event['details']}")
+
+                if event.get("created_at"):
+                    st.caption(f"Failure recorded: {event['created_at']}")
 
     st.divider()
 
