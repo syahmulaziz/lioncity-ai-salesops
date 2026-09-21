@@ -1,5 +1,5 @@
 from datetime import datetime
-from app.database import log_sales_event
+from app.database import get_connection, log_sales_event
 
 
 def create_order(
@@ -13,16 +13,72 @@ def create_order(
     delivery_date: str
 ):
     """
-    Create a prototype LionCity sales order.
+    Create and persist a confirmed LionCity sales order.
 
-    For the internal prototype this does not write to an ERP.
-    It returns a controlled mock order confirmation.
+    The order and its line items are written to the local
+    LionCity database before success is returned.
     """
 
-    timestamp = datetime.now().strftime("%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
 
     order_id = f"SO-DEMO-{timestamp}"
 
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+        # Persist the confirmed order first.
+        cursor.execute("""
+            INSERT INTO orders (
+                order_id,
+                customer_id,
+                order_date,
+                delivery_area,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            order_id,
+            customer_id,
+            datetime.now().strftime("%Y-%m-%d"),
+            delivery_area,
+            "CONFIRMED",
+        ))
+
+        # Persist every line item belonging to the order.
+        for item in items:
+            cursor.execute("""
+                INSERT INTO order_items (
+                    order_id,
+                    sku,
+                    quantity,
+                    unit_price
+                )
+                VALUES (?, ?, ?, ?)
+            """, (
+                order_id,
+                item["sku"],
+                item["quantity"],
+                item["unit_price"],
+            ))
+
+        # The order and all line items must succeed together.
+        connection.commit()
+
+    except Exception as error:
+        connection.rollback()
+
+        return {
+            "success": False,
+            "error": "ORDER_CREATION_FAILED",
+            "message": str(error),
+        }
+
+    finally:
+        connection.close()
+
+    # Only log ORDER_CONFIRMED after the real order
+    # has been successfully persisted.
     log_sales_event(
         event_type="ORDER_CONFIRMED",
         customer_id=customer_id,

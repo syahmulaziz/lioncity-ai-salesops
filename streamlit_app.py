@@ -703,18 +703,85 @@ with sales_tab:
                                 ),
                             )
 
-                            if result["success"]:
-
-                                st.success("✓ Commercial transaction approved.")
-
-                                st.rerun()
-
-                            else:
+                            if not result["success"]:
 
                                 st.error(
                                     "Commercial approval could not "
                                     "be recorded."
                                 )
+
+                            else:
+
+                                # Resume the same WhatsApp SalesAgent after the
+                                # commercial authority decision has been recorded.
+                                try:
+
+                                    with st.spinner(
+                                        "Applying commercial approval "
+                                        "and resuming customer conversation..."
+                                    ):
+
+                                        api_response = requests.post(
+                                            "http://localhost:8000/process-approvals",
+                                            timeout=90,
+                                        )
+
+                                    api_response.raise_for_status()
+
+                                    api_result = api_response.json()
+
+                                    approval_id = request["approval_id"]
+
+                                    if approval_id in api_result.get(
+                                        "processed",
+                                        [],
+                                    ):
+
+                                        st.success(
+                                            "✓ Commercial transaction approved "
+                                            "and customer conversation resumed."
+                                        )
+
+                                    else:
+
+                                        st.error(
+                                            "Commercial approval was recorded, "
+                                            "but FastAPI did not apply it."
+                                        )
+
+                                        skipped = api_result.get(
+                                            "skipped",
+                                            [],
+                                        )
+
+                                        if skipped:
+                                            st.json(skipped)
+
+                                except requests.exceptions.ConnectionError:
+
+                                    st.error(
+                                        "Commercial approval was saved, "
+                                        "but FastAPI could not be reached."
+                                    )
+
+                                except requests.exceptions.Timeout:
+
+                                    st.error(
+                                        "Commercial approval was saved, "
+                                        "but FastAPI timed out."
+                                    )
+
+                                except Exception as error:
+
+                                    st.error(
+                                        "Commercial approval was saved, "
+                                        "but an error occurred while "
+                                        "resuming the customer conversation."
+                                    )
+
+                                    st.code(str(error))
+
+                                st.rerun()
 
                     # Commercial authority requests use the
                     # dedicated approval UI above.

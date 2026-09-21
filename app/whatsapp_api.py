@@ -811,10 +811,20 @@ def process_approvals():
         # Resume Claude with trusted human decision.
         # -------------------------------------------------
 
-        result = agent.apply_human_approval(
-            approved_discount_percent=
-                approved_percent
-        )
+        approval_type = approval.get("approval_type")
+
+        if approval_type == "COMMERCIAL_AUTHORITY":
+            result = (
+                agent.apply_commercial_authority_approval(
+                    approval
+                )
+            )
+
+        else:
+            result = agent.apply_human_approval(
+                approved_discount_percent=
+                    approved_percent
+            )
 
         if not result.get("success"):
 

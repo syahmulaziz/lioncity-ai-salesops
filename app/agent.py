@@ -774,27 +774,45 @@ def execute_tool(tool_name: str, tool_input: dict):
     # HAFIZAH: ADDED TOOL FOR EVALUATE_COMMERCIAL_AUTHORITY
     if tool_name == "evaluate_commercial_authority":
         authority_result = evaluate_commercial_authority(
-        tool_input["sku"],
-        tool_input["quantity"],
-        tool_input["order_value"],
-        tool_input["discount_percent"]
+            tool_input["sku"],
+            tool_input["quantity"],
+            tool_input["order_value"],
+            tool_input["discount_percent"]
         )
 
         if (
             authority_result.get("success")
             and authority_result.get("requires_human_approval")
         ):
-            approval_result = create_approval_request(
+            # Before creating another approval request, check whether
+            # this exact transaction has already been human-approved.
+            existing_approval = get_matching_commercial_approval(
                 phone=tool_input["phone"],
-                requested_percent=tool_input["discount_percent"],
-                approval_type="COMMERCIAL_AUTHORITY",
                 sku=tool_input["sku"],
                 requested_quantity=tool_input["quantity"],
                 order_value=tool_input["order_value"],
-                reason=",".join(authority_result.get("reasons", []))
+                discount_percent=tool_input["discount_percent"],
             )
 
-            authority_result["approval"] = approval_result
+            if existing_approval is not None:
+                authority_result["requires_human_approval"] = False
+                authority_result["human_approved"] = True
+                authority_result["approval"] = existing_approval
+
+            else:
+                approval_result = create_approval_request(
+                    phone=tool_input["phone"],
+                    requested_percent=tool_input["discount_percent"],
+                    approval_type="COMMERCIAL_AUTHORITY",
+                    sku=tool_input["sku"],
+                    requested_quantity=tool_input["quantity"],
+                    order_value=tool_input["order_value"],
+                    reason=",".join(
+                        authority_result.get("reasons", [])
+                    )
+                )
+
+                authority_result["approval"] = approval_result
 
         return authority_result
 
@@ -1467,6 +1485,59 @@ class SalesAgent:
             "success": False,
             "error": "MAX_ITERATIONS_REACHED"
         }
+
+    def apply_commercial_authority_approval(
+        self,
+        approval: dict
+    ):
+        """
+        Inject a trusted human approval for a transaction that
+        exceeded the AI Sales Agent's commercial authority.
+
+        Unlike the legacy discount approval flow, commercial
+        authority approval may relate to quantity, order value,
+        discount, or multiple authority limits.
+        """
+
+        sku = approval.get("sku")
+        requested_quantity = approval.get("requested_quantity")
+        order_value = approval.get("order_value")
+        requested_percent = approval.get("requested_percent")
+        reasons = approval.get("reason") or ""
+
+        self.log_activity(
+            "commercial_authority_approval",
+            "Human approved commercial transaction",
+            {
+                "approval_id": approval.get("approval_id"),
+                "sku": sku,
+                "requested_quantity": requested_quantity,
+                "order_value": order_value,
+                "requested_percent": requested_percent,
+                "reasons": reasons,
+            }
+        )
+
+        self.messages.append({
+            "role": "user",
+            "content": (
+                "[TRUSTED HUMAN COMMERCIAL AUTHORITY APPROVAL]\n"
+                "A sales representative has reviewed and approved "
+                "the proposed commercial transaction.\n"
+                f"SKU: {sku}\n"
+                f"Quantity: {requested_quantity}\n"
+                f"Order value: {order_value}\n"
+                f"Discount: {requested_percent}%\n\n"
+                "The transaction has human approval to proceed "
+                "despite exceeding the AI Sales Agent's normal "
+                "commercial authority. Continue the existing "
+                "customer conversation using the approved "
+                "transaction details. Do not change the approved "
+                "quantity, order value or discount."
+            )
+        })
+
+        return self._continue_after_human_action()
 
     def apply_human_approval(
         self,
