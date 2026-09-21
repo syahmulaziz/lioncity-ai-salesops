@@ -326,10 +326,19 @@ with sales_tab:
                         f"{sales_state['discount_percent']:.0f}%"
                     )
 
-                    st.write(
-                        "**Revised Offer:** "
-                        f"S${sales_state['quote_amount']:,.2f}"
-                    )
+                    if sales_state["quote_amount"] is not None:
+
+                        st.write(
+                            "**Revised Offer:** "
+                            f"S${sales_state['quote_amount']:,.2f}"
+                        )
+
+                    else:
+
+                        st.write(
+                            "**Revised Offer:** "
+                            "Sent to customer on WhatsApp"
+                        )
 
                     st.info(
                         "Revised offer has been sent "

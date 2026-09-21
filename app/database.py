@@ -1390,8 +1390,12 @@ def get_sales_metrics():
 
 def get_latest_sales_state():
     """
-    Derive the current demo sales state from persisted
-    SalesOps events and approval records.
+    Derive the current sales state from persisted SalesOps
+    events and approval records.
+
+    Quote amounts are shown only when an authoritative
+    persisted amount exists. No demo/default quote values
+    are fabricated here.
     """
 
     connection = get_connection()
@@ -1453,6 +1457,10 @@ def get_latest_sales_state():
 
     # -------------------------------------------------
     # Order completed
+    #
+    # ORDER_CONFIRMED.amount is authoritative because
+    # it was persisted as part of the confirmed order
+    # event.
     # -------------------------------------------------
 
     if event["event_type"] == "ORDER_CONFIRMED":
@@ -1470,7 +1478,12 @@ def get_latest_sales_state():
         }
 
     # -------------------------------------------------
-    # Human has approved counteroffer
+    # Human decision has been processed.
+    #
+    # We know the approved percentage, but we do NOT
+    # currently have an authoritative persisted revised
+    # quote total here. Therefore do not calculate one
+    # from old demo constants.
     # -------------------------------------------------
 
     if (
@@ -1478,29 +1491,19 @@ def get_latest_sales_state():
         and approval["status"] == "PROCESSED"
     ):
 
-        approved_percent = (
-            approval["approved_percent"]
-        )
-
-        revised_total = (
-            4700
-            * (
-                1
-                - approved_percent / 100
-            )
-            + 35
-        )
-
         return {
             "status": "AWAITING_CUSTOMER",
             "status_label": "Awaiting Customer Decision",
-            "quote_amount": revised_total,
-            "discount_percent": approved_percent,
+            "quote_amount": None,
+            "discount_percent": approval["approved_percent"],
             "order_id": None,
         }
 
     # -------------------------------------------------
-    # Waiting for human decision
+    # Waiting for human decision.
+    #
+    # Approval existence is authoritative; a current
+    # quote amount is not available from this state.
     # -------------------------------------------------
 
     if (
@@ -1514,19 +1517,22 @@ def get_latest_sales_state():
         return {
             "status": "HUMAN_APPROVAL",
             "status_label": "Human Approval Required",
-            "quote_amount": 4735.0,
+            "quote_amount": None,
             "discount_percent": None,
             "order_id": None,
         }
 
     # -------------------------------------------------
-    # Normal active conversation
+    # Normal active conversation.
+    #
+    # A sales event proves that activity exists, but it
+    # does NOT prove a S$4,735 quote exists.
     # -------------------------------------------------
 
     return {
         "status": "AI_HANDLING",
         "status_label": "AI Handling Conversation",
-        "quote_amount": 4735.0,
+        "quote_amount": None,
         "discount_percent": None,
         "order_id": None,
     }
