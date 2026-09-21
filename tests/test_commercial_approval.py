@@ -136,6 +136,11 @@ def test_commercial_approval_resumes_agent(monkeypatch):
     agent = object.__new__(agent_module.SalesAgent)
 
     agent.messages = []
+
+    # This test bypasses SalesAgent.__init__, so initialise
+    # the commercial-order state manually.
+    agent.pending_commercial_order = None
+
     logged = []
 
     def fake_log_activity(activity_type, message, details=None):
@@ -205,4 +210,19 @@ def test_commercial_approval_resumes_agent(monkeypatch):
     assert (
         logged[0]["activity_type"]
         == "commercial_authority_approval"
+    )
+
+    assert (
+        "customer had already explicitly confirmed"
+        in trusted_message["content"].lower()
+    )
+
+    assert (
+        "do not ask the customer to confirm the same order again"
+        in trusted_message["content"].lower()
+    )
+
+    assert (
+        "use the create_order tool"
+        in trusted_message["content"].lower()
     )

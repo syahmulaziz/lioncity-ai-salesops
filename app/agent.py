@@ -958,6 +958,13 @@ class SalesAgent:
         # Human-in-the-loop state
         self.pending_approval = None
 
+        # Commercial order waiting for human authority approval.
+        #
+        # Unlike pending_approval (legacy discount HITL), this stores
+        # the exact confirmed transaction so order creation can resume
+        # deterministically after commercial approval.
+        self.pending_commercial_order = None
+
         # RESPONSE-CYCLE GROUNDING STATE (Person 1 grounding fixes).
         #
         # These hold the TRUSTED result of the most recent check_delivery /
@@ -1202,6 +1209,23 @@ class SalesAgent:
 
         # TRUSTED PATH: run the existing business tool unchanged.
         result = execute_tool(tool_name, tool_input)
+
+        # If the customer has already confirmed the order but
+        # commercial authority prevents creation, preserve the
+        # exact transaction on THIS SalesAgent instance so it can
+        # resume deterministically after human approval.
+        if (
+            tool_name == "create_order"
+            and isinstance(result, dict)
+            and result.get("error") == "HUMAN_APPROVAL_REQUIRED"
+        ):
+            self.pending_commercial_order = dict(tool_input)
+
+            self.log_activity(
+                "commercial_order_pending_approval",
+                "Confirmed order waiting for commercial approval",
+                self.pending_commercial_order.copy(),
+            )
 
         # Ingest verified results into Category B via trusted setters only.
         self._ingest_tool_side_effects(tool_name, result)
@@ -1885,21 +1909,111 @@ class SalesAgent:
                 f"Quantity: {requested_quantity}\n"
                 f"Order value: {order_value}\n"
                 f"Discount: {requested_percent}%\n\n"
-                "The transaction has human approval to proceed "
+
+                "The customer had already explicitly confirmed that "
+                "they wanted to proceed with this order before the "
+                "commercial authority approval was requested.\n\n"
+
+                "The transaction now has human approval to proceed "
                 "despite exceeding the AI Sales Agent's normal "
-                "commercial authority. Continue the existing "
-                "customer conversation using the approved "
-                "transaction details. Do not change the approved "
-                "quantity, order value or discount."
+                "commercial authority.\n\n"
+
+                "Resume the interrupted order-creation flow now. "
+                "Do not ask the customer to confirm the same order again. "
+                "Re-evaluate commercial authority using the approved "
+                "transaction details and, once the approval is recognised, "
+                "use the create_order tool to create the order.\n\n"
+
+                "Do not claim that the order has been created unless "
+                "create_order returns success. "
+                "Do not change the approved quantity, order value, "
+                "discount, delivery details, or other confirmed "
+                "transaction details."
             )
         })
 
-        # Reset response-cycle grounding ONCE before starting this fresh
-        # approval-continuation cycle (not inside the recursive tool loop),
-        # so a delivery/catalogue result from the PRECEDING customer turn
-        # can never leak into this continuation's response.
+        # Reset response-cycle grounding before resuming the
+        # approved commercial transaction.
         self._reset_response_grounding()
 
+        # If create_order was previously blocked by commercial
+        # authority, we preserved its exact trusted input.
+        #
+        # Resume that exact order deterministically instead of
+        # relying on the LLM to reconstruct transaction details
+        # from conversation history.
+        if self.pending_commercial_order is not None:
+
+            pending_order = self.pending_commercial_order.copy()
+
+            order_result = self._handle_tool(
+                "create_order",
+                pending_order,
+            )
+
+            if order_result.get("success"):
+
+                # Clear only after successful persistence.
+                self.pending_commercial_order = None
+
+                order_id = order_result.get("order_id")
+
+                self.log_activity(
+                    "commercial_order_resumed",
+                    "Human-approved order created successfully",
+                    {
+                        "approval_id": approval.get("approval_id"),
+                        "order_id": order_id,
+                    },
+                )
+
+                confirmation = (
+                    "Your order has been successfully created"
+                )
+
+                if order_id:
+                    confirmation += f". Order reference: {order_id}"
+
+                confirmation += "."
+
+                self.messages.append({
+                    "role": "assistant",
+                    "content": confirmation,
+                })
+
+                return {
+                    "success": True,
+                    "response": confirmation,
+                    "order": order_result,
+                }
+
+            # Keep pending_commercial_order intact when creation
+            # fails so the transaction is not silently lost.
+            self.log_activity(
+                "commercial_order_resume_failed",
+                "Human-approved order could not be created",
+                {
+                    "approval_id": approval.get("approval_id"),
+                    "error": order_result.get("error"),
+                    "message": order_result.get("message"),
+                },
+            )
+
+            return {
+                "success": False,
+                "error": (
+                    order_result.get("error")
+                    or "ORDER_CREATION_FAILED"
+                ),
+                "message": (
+                    order_result.get("message")
+                    or "Approved order could not be created."
+                ),
+                "order_result": order_result,
+            }
+
+        # Backward-compatible fallback for commercial approvals
+        # that were created before pending order state existed.
         return self._continue_after_human_action()
 
     def apply_human_approval(
