@@ -18,7 +18,8 @@ from app.database import (
     add_delivery_slot,
     remove_delivery_slot,
     get_commercial_policies,
-    update_commercial_policy
+    update_commercial_policy,
+    add_product_with_inventory,
 )
 
 
@@ -107,15 +108,6 @@ if st.button(
 
     st.divider()
 
-    st.subheader("Demo Customer")
-
-    st.write("**Apex Engineering Pte Ltd**")
-    st.write("Syahmul Aziz")
-    st.write("GOLD Account")
-    st.write("Sales Rep: Marcus")
-
-    st.divider()
-
     st.caption(
         "Customer conversations occur through "
         "real WhatsApp. This console is used by "
@@ -166,7 +158,7 @@ with sales_tab:
 
         st.metric(
             "Active Customer",
-            "Apex Engineering"
+            "—"
         )
 
 
@@ -174,7 +166,7 @@ with sales_tab:
 
         st.metric(
             "Account Tier",
-            "GOLD"
+            "—"
         )
 
 
@@ -283,237 +275,23 @@ with sales_tab:
             "📱 Live WhatsApp Deal"
         )
 
+        if status == "READY":
+
+            st.info(
+                "No active WhatsApp deal. "
+                "Waiting for a customer enquiry."
+            )
+
+        else:
+
+            st.info(
+                "WhatsApp sales activity is in progress."
+            )
 
         # -------------------------------------------------
         # CUSTOMER
         # -------------------------------------------------
 
-        with st.container(
-            border=True
-        ):
-
-            st.markdown(
-                "### Apex Engineering Pte Ltd"
-            )
-
-            customer_col, status_col = (
-                st.columns([2, 1])
-            )
-
-
-            with customer_col:
-
-                st.write(
-                    "**Contact:** Syahmul Aziz"
-                )
-
-                st.write(
-                    "**WhatsApp:** +65 8165 8457"
-                )
-
-                st.write(
-                    "**Sales Rep:** Marcus"
-                )
-
-
-            with status_col:
-
-                st.success(
-                    "GOLD"
-                )
-
-                if status == "ORDER_CONFIRMED":
-
-                    st.success(
-                        "✓ CONFIRMED"
-                    )
-
-                elif status == "HUMAN_APPROVAL":
-
-                    st.error(
-                        "APPROVAL"
-                    )
-
-                elif status == "AWAITING_CUSTOMER":
-
-                    st.warning(
-                        "CUSTOMER"
-                    )
-
-                elif status == "AI_HANDLING":
-
-                    st.info(
-                        "AI ACTIVE"
-                    )
-
-                else:
-
-                    st.write(
-                        "WAITING"
-                    )
-
-
-        # -------------------------------------------------
-        # DEAL ITEMS
-        # -------------------------------------------------
-
-        st.markdown(
-            "#### Current Deal"
-        )
-
-
-        deal_data = pd.DataFrame([
-            {
-                "SKU": "CBL-210",
-                "Product":
-                    "Industrial Cable",
-                "Qty": 300,
-                "Unit Price":
-                    "S$12.00",
-                "Subtotal":
-                    "S$3,600",
-            },
-            {
-                "SKU": "ADP-120",
-                "Product":
-                    "Industrial Adapter",
-                "Qty": 50,
-                "Unit Price":
-                    "S$18.00",
-                "Subtotal":
-                    "S$900",
-            },
-            {
-                "SKU": "TIE-100",
-                "Product":
-                    "Heavy Duty Cable Tie",
-                "Qty": 100,
-                "Unit Price":
-                    "S$2.00",
-                "Subtotal":
-                    "S$200",
-            },
-        ])
-
-
-        st.dataframe(
-            deal_data,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-        # -------------------------------------------------
-        # BASE COMMERCIAL VALUES
-        # -------------------------------------------------
-
-        deal_metric_1, deal_metric_2 = (
-            st.columns(2)
-        )
-
-
-        with deal_metric_1:
-
-            st.metric(
-                "Product Subtotal",
-                "S$4,700.00"
-            )
-
-
-        with deal_metric_2:
-
-            st.metric(
-                "Delivery",
-                "S$35.00"
-            )
-
-
-        # -------------------------------------------------
-        # APPROVED DISCOUNT
-        # -------------------------------------------------
-
-        if (
-            sales_state[
-                "discount_percent"
-            ]
-            is not None
-        ):
-
-            approved_discount = (
-                sales_state[
-                    "discount_percent"
-                ]
-            )
-
-            discount_amount = (
-                4700
-                * approved_discount
-                / 100
-            )
-
-            st.success(
-                f"✓ Approved Discount: "
-                f"{approved_discount:.0f}% "
-                f"(−S${discount_amount:,.2f})"
-            )
-
-
-        # -------------------------------------------------
-        # LIVE TOTAL
-        # -------------------------------------------------
-
-        if quote_amount is not None:
-
-            st.metric(
-                "Current Deal Value",
-                f"S${quote_amount:,.2f}"
-            )
-
-
-        # -------------------------------------------------
-        # DELIVERY
-        # -------------------------------------------------
-
-        st.info(
-            "🚚 Jurong · Tuesday, "
-            "15 September 2026"
-        )
-
-
-        # -------------------------------------------------
-        # VERIFIED BUSINESS FACTS
-        # -------------------------------------------------
-
-        if status != "READY":
-
-            st.success(
-                "✓ Inventory verified  "
-                "✓ Contract pricing verified  "
-                "✓ Delivery verified"
-            )
-
-
-        # -------------------------------------------------
-        # CONFIRMED ORDER
-        # -------------------------------------------------
-
-        if status == "ORDER_CONFIRMED":
-
-            st.divider()
-
-            st.success(
-                "🎉 Sale completed successfully"
-            )
-
-            st.write(
-                "**Order Number:** "
-                f"{sales_state['order_id']}"
-            )
-
-            st.write(
-                "**Confirmed Value:** "
-                f"S${sales_state['quote_amount']:,.2f}"
-            )
 
 
     # =====================================================
@@ -1062,519 +840,654 @@ with data_tab:
 
         st.divider()
 
-        st.subheader("Update Inventory")
+        st.subheader("Manage Inventory")
 
-        selected_sku = st.selectbox(
-            "Product",
-            inventory_view["SKU"].tolist(),
-            key="inventory_product",
+        inventory_action = st.radio(
+            "Action",
+            [
+                "Add New Product",
+                "Update Existing Inventory",
+            ],
+            horizontal=True,
+            key="inventory_action",
         )
 
-        current_stock = int(
-            inventory_view.loc[
-                inventory_view["SKU"]
-                == selected_sku,
-                "Available Stock",
-            ].iloc[0]
-        )
+        # =================================================
+        # ADD NEW PRODUCT
+        # =================================================
 
-        new_stock = st.number_input(
-            "Available Quantity",
-            min_value=0,
-            value=current_stock,
-            step=1,
-            key="inventory_quantity",
-        )
+        if inventory_action == "Add New Product":
 
-        if st.button(
-            "Update Inventory",
-            type="primary",
-            key="update_inventory",
-        ):
+            st.markdown("#### Add New Product")
 
-            result = update_inventory(
-                selected_sku,
-                int(new_stock),
-            )
+            add_product_col_1, add_product_col_2 = st.columns(2)
 
-            if result["success"]:
+            with add_product_col_1:
 
-                st.success(
-                    f"{selected_sku} updated to "
-                    f"{int(new_stock)} units."
+                new_sku = st.text_input(
+                    "SKU",
+                    placeholder="CBL-300",
+                    key="new_product_sku",
                 )
 
-                st.rerun()
+                new_product_name = st.text_input(
+                    "Product Name",
+                    placeholder="Outdoor Cable",
+                    key="new_product_name",
+                )
+
+                new_description = st.text_area(
+                    "Description",
+                    placeholder="Outdoor-rated electrical cable",
+                    key="new_product_description",
+                )
+
+            with add_product_col_2:
+
+                new_category = st.text_input(
+                    "Category",
+                    placeholder="Electrical",
+                    key="new_product_category",
+                )
+
+                new_list_price = st.number_input(
+                    "List Price (S$)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=1.0,
+                    format="%.2f",
+                    key="new_product_price",
+                )
+
+                new_initial_stock = st.number_input(
+                    "Initial Stock",
+                    min_value=0,
+                    value=0,
+                    step=1,
+                    key="new_product_stock",
+                )
+
+            if st.button(
+                "Add Product",
+                type="primary",
+                use_container_width=True,
+                key="add_product_button",
+            ):
+
+                if (
+                    not new_sku.strip()
+                    or not new_product_name.strip()
+                ):
+
+                    st.error(
+                        "SKU and Product Name are required."
+                    )
+
+                else:
+
+                    result = add_product_with_inventory(
+                        sku=new_sku,
+                        product_name=new_product_name,
+                        description=new_description,
+                        category=new_category,
+                        list_price=float(new_list_price),
+                        available_quantity=int(new_initial_stock),
+                    )
+
+                    if result["success"]:
+
+                        st.success(
+                            f"{result['sku']} — "
+                            f"{result['product_name']} added "
+                            f"with {result['available_quantity']} "
+                            f"units of inventory."
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        if result["error"] == "SKU_ALREADY_EXISTS":
+
+                            st.error(
+                                f"SKU {result['sku']} already exists."
+                            )
+
+                        else:
+
+                            st.error(
+                                f"Could not add product: "
+                                f"{result['error']}"
+                            )
+
+        # =================================================
+        # UPDATE EXISTING INVENTORY
+        # =================================================
+
+        elif inventory_action == "Update Existing Inventory":
+
+            st.markdown("#### Update Existing Inventory")
+
+            if inventory_view.empty:
+
+                st.info(
+                    "There are no inventory items to update."
+                )
 
             else:
 
-                st.error(
-                    result["error"]
+                selected_sku = st.selectbox(
+                    "Product",
+                    inventory_view["SKU"].tolist(),
+                    key="inventory_product",
                 )
 
+                current_stock = int(
+                    inventory_view.loc[
+                        inventory_view["SKU"] == selected_sku,
+                        "Available Stock",
+                    ].iloc[0]
+                )
 
-    # =====================================================
+                new_stock = st.number_input(
+                    "Available Quantity",
+                    min_value=0,
+                    value=current_stock,
+                    step=1,
+                    key="inventory_quantity",
+                )
+
+                if st.button(
+                    "Update Inventory",
+                    type="primary",
+                    key="update_inventory",
+                ):
+
+                    result = update_inventory(
+                        selected_sku,
+                        int(new_stock),
+                    )
+
+                    if result["success"]:
+
+                        st.success(
+                            f"{selected_sku} updated to "
+                            f"{int(new_stock)} units."
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            result["error"]
+                        )
+
+        
+
+
+            # =====================================================
 # CUSTOMERS
 # =====================================================
 
-with customer_tab:
+    with customer_tab:
 
-    st.subheader("Customer Accounts")
+        st.subheader("Customer Accounts")
 
-    customers_df = pd.DataFrame(
-        get_table_data("customers")
-    )
-
-    # -------------------------------------------------
-    # CURRENT CUSTOMER TABLE
-    # -------------------------------------------------
-
-    if not customers_df.empty:
-
-        customer_display = customers_df.rename(
-            columns={
-                "customer_id": "Customer ID",
-                "company_name": "Company",
-                "contact_name": "Contact",
-                "phone": "Phone",
-                "account_tier": "Tier",
-                "delivery_area": "Delivery Area",
-                "assigned_sales_rep": "Sales Rep",
-            }
+        customers_df = pd.DataFrame(
+            get_table_data("customers")
         )
 
-        st.dataframe(
-            customer_display,
-            use_container_width=True,
-            hide_index=True,
+        # -------------------------------------------------
+        # CURRENT CUSTOMER TABLE
+        # -------------------------------------------------
+
+        if not customers_df.empty:
+
+            customer_display = customers_df.rename(
+                columns={
+                    "customer_id": "Customer ID",
+                    "company_name": "Company",
+                    "contact_name": "Contact",
+                    "phone": "Phone",
+                    "account_tier": "Tier",
+                    "delivery_area": "Delivery Area",
+                    "assigned_sales_rep": "Sales Rep",
+                }
+            )
+
+            st.dataframe(
+                customer_display,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        else:
+
+            st.info(
+                "No customer accounts currently exist."
+            )
+
+
+        st.divider()
+
+
+        # =================================================
+        # CUSTOMER MANAGEMENT
+        # =================================================
+
+        st.subheader("Manage Customer")
+
+        customer_action = st.radio(
+            "Action",
+            [
+                "Add Customer",
+                "Update Customer",
+                "Remove Customer",
+            ],
+            horizontal=True,
+            key="customer_action",
         )
 
-    else:
 
-        st.info(
-            "No customer accounts currently exist."
-        )
+        # =================================================
+        # ADD CUSTOMER
+        # =================================================
 
+        if customer_action == "Add Customer":
 
-    st.divider()
+            st.markdown("#### Add New Customer")
 
+            add_col_1, add_col_2 = st.columns(2)
 
-    # =================================================
-    # CUSTOMER MANAGEMENT
-    # =================================================
+            with add_col_1:
 
-    st.subheader("Manage Customer")
+                new_customer_id = st.text_input(
+                    "Customer ID",
+                    placeholder="CUST-003",
+                    key="new_customer_id",
+                )
 
-    customer_action = st.radio(
-        "Action",
-        [
-            "Add Customer",
-            "Update Customer",
-            "Remove Customer",
-        ],
-        horizontal=True,
-        key="customer_action",
-    )
+                new_company = st.text_input(
+                    "Company Name",
+                    placeholder="Nova Engineering Pte Ltd",
+                    key="new_customer_company",
+                )
 
+                new_contact = st.text_input(
+                    "Contact Name",
+                    placeholder="Alex Tan",
+                    key="new_customer_contact",
+                )
 
-    # =================================================
-    # ADD CUSTOMER
-    # =================================================
-
-    if customer_action == "Add Customer":
-
-        st.markdown("#### Add New Customer")
-
-        add_col_1, add_col_2 = st.columns(2)
-
-        with add_col_1:
-
-            new_customer_id = st.text_input(
-                "Customer ID",
-                placeholder="CUST-003",
-                key="new_customer_id",
-            )
-
-            new_company = st.text_input(
-                "Company Name",
-                placeholder="Nova Engineering Pte Ltd",
-                key="new_customer_company",
-            )
-
-            new_contact = st.text_input(
-                "Contact Name",
-                placeholder="Alex Tan",
-                key="new_customer_contact",
-            )
-
-            new_phone = st.text_input(
-                "WhatsApp / Phone",
-                placeholder="+6591234567",
-                key="new_customer_phone",
-            )
+                new_phone = st.text_input(
+                    "WhatsApp / Phone",
+                    placeholder="+6591234567",
+                    key="new_customer_phone",
+                )
 
 
-        with add_col_2:
+            with add_col_2:
 
-            new_tier = st.selectbox(
-                "Account Tier",
-                [
-                    "STANDARD",
-                    "GOLD",
-                ],
-                key="new_customer_tier",
-            )
+                new_tier = st.selectbox(
+                    "Account Tier",
+                    [
+                        "STANDARD",
+                        "GOLD",
+                    ],
+                    key="new_customer_tier",
+                )
 
-            new_area = st.text_input(
-                "Delivery Area",
-                placeholder="Jurong",
-                key="new_customer_area",
-            )
+                new_area = st.text_input(
+                    "Delivery Area",
+                    placeholder="Jurong",
+                    key="new_customer_area",
+                )
 
-            new_sales_rep = st.text_input(
-                "Assigned Sales Rep",
-                placeholder="Marcus",
-                key="new_customer_rep",
-            )
+                new_sales_rep = st.text_input(
+                    "Assigned Sales Rep",
+                    placeholder="Marcus",
+                    key="new_customer_rep",
+                )
 
 
-        if st.button(
-            "Add Customer",
-            type="primary",
-            use_container_width=True,
-            key="add_customer_button",
-        ):
-
-            if (
-                not new_customer_id.strip()
-                or not new_company.strip()
-                or not new_contact.strip()
-                or not new_phone.strip()
-                or not new_area.strip()
-                or not new_sales_rep.strip()
+            if st.button(
+                "Add Customer",
+                type="primary",
+                use_container_width=True,
+                key="add_customer_button",
             ):
 
-                st.error(
-                    "Please complete all customer fields."
+                if (
+                    not new_customer_id.strip()
+                    or not new_company.strip()
+                    or not new_contact.strip()
+                    or not new_phone.strip()
+                    or not new_area.strip()
+                    or not new_sales_rep.strip()
+                ):
+
+                    st.error(
+                        "Please complete all customer fields."
+                    )
+
+                else:
+
+                    result = add_customer(
+                        customer_id=
+                            new_customer_id.strip(),
+                        company_name=
+                            new_company.strip(),
+                        contact_name=
+                            new_contact.strip(),
+                        phone=
+                            new_phone.strip(),
+                        account_tier=
+                            new_tier,
+                        delivery_area=
+                            new_area.strip(),
+                        assigned_sales_rep=
+                            new_sales_rep.strip(),
+                    )
+
+                    if result["success"]:
+
+                        st.success(
+                            f"Customer "
+                            f"{new_customer_id.strip()} "
+                            f"added successfully."
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            f"Could not add customer: "
+                            f"{result['error']}"
+                        )
+
+
+        # =================================================
+        # UPDATE CUSTOMER
+        # =================================================
+
+        elif customer_action == "Update Customer":
+
+            st.markdown("#### Update Customer")
+
+            if customers_df.empty:
+
+                st.info(
+                    "There are no customers to update."
                 )
 
             else:
 
-                result = add_customer(
-                    customer_id=
-                        new_customer_id.strip(),
-                    company_name=
-                        new_company.strip(),
-                    contact_name=
-                        new_contact.strip(),
-                    phone=
-                        new_phone.strip(),
-                    account_tier=
-                        new_tier,
-                    delivery_area=
-                        new_area.strip(),
-                    assigned_sales_rep=
-                        new_sales_rep.strip(),
-                )
-
-                if result["success"]:
-
-                    st.success(
-                        f"Customer "
-                        f"{new_customer_id.strip()} "
-                        f"added successfully."
-                    )
-
-                    st.rerun()
-
-                else:
-
-                    st.error(
-                        f"Could not add customer: "
-                        f"{result['error']}"
-                    )
-
-
-    # =================================================
-    # UPDATE CUSTOMER
-    # =================================================
-
-    elif customer_action == "Update Customer":
-
-        st.markdown("#### Update Customer")
-
-        if customers_df.empty:
-
-            st.info(
-                "There are no customers to update."
-            )
-
-        else:
-
-            customer_ids = (
-                customers_df[
-                    "customer_id"
-                ].tolist()
-            )
-
-            selected_customer_id = st.selectbox(
-                "Select Customer",
-                customer_ids,
-                key="update_customer_select",
-            )
-
-            selected_customer = (
-                customers_df[
+                customer_ids = (
                     customers_df[
                         "customer_id"
-                    ] == selected_customer_id
-                ]
-                .iloc[0]
-            )
-
-
-            update_col_1, update_col_2 = st.columns(2)
-
-
-            with update_col_1:
-
-                updated_company = st.text_input(
-                    "Company Name",
-                    value=str(
-                        selected_customer[
-                            "company_name"
-                        ]
-                    ),
-                    key=(
-                        "update_company_"
-                        f"{selected_customer_id}"
-                    ),
+                    ].tolist()
                 )
 
-                updated_contact = st.text_input(
-                    "Contact Name",
-                    value=str(
-                        selected_customer[
-                            "contact_name"
-                        ]
-                    ),
-                    key=(
-                        "update_contact_"
-                        f"{selected_customer_id}"
-                    ),
+                selected_customer_id = st.selectbox(
+                    "Select Customer",
+                    customer_ids,
+                    key="update_customer_select",
                 )
 
-                updated_phone = st.text_input(
-                    "WhatsApp / Phone",
-                    value=str(
-                        selected_customer[
-                            "phone"
-                        ]
-                    ),
-                    key=(
-                        "update_phone_"
-                        f"{selected_customer_id}"
-                    ),
-                )
-
-
-            with update_col_2:
-
-                current_tier = str(
-                    selected_customer[
-                        "account_tier"
+                selected_customer = (
+                    customers_df[
+                        customers_df[
+                            "customer_id"
+                        ] == selected_customer_id
                     ]
+                    .iloc[0]
                 )
 
-                tier_options = [
-                    "STANDARD",
-                    "GOLD",
-                ]
 
-                tier_index = (
-                    tier_options.index(
-                        current_tier
+                update_col_1, update_col_2 = st.columns(2)
+
+
+                with update_col_1:
+
+                    updated_company = st.text_input(
+                        "Company Name",
+                        value=str(
+                            selected_customer[
+                                "company_name"
+                            ]
+                        ),
+                        key=(
+                            "update_company_"
+                            f"{selected_customer_id}"
+                        ),
                     )
-                    if current_tier
-                    in tier_options
-                    else 0
-                )
 
-                updated_tier = st.selectbox(
-                    "Account Tier",
-                    tier_options,
-                    index=tier_index,
-                    key=(
-                        "update_tier_"
-                        f"{selected_customer_id}"
-                    ),
-                )
+                    updated_contact = st.text_input(
+                        "Contact Name",
+                        value=str(
+                            selected_customer[
+                                "contact_name"
+                            ]
+                        ),
+                        key=(
+                            "update_contact_"
+                            f"{selected_customer_id}"
+                        ),
+                    )
 
-                updated_area = st.text_input(
-                    "Delivery Area",
-                    value=str(
+                    updated_phone = st.text_input(
+                        "WhatsApp / Phone",
+                        value=str(
+                            selected_customer[
+                                "phone"
+                            ]
+                        ),
+                        key=(
+                            "update_phone_"
+                            f"{selected_customer_id}"
+                        ),
+                    )
+
+
+                with update_col_2:
+
+                    current_tier = str(
                         selected_customer[
-                            "delivery_area"
+                            "account_tier"
                         ]
-                    ),
-                    key=(
-                        "update_area_"
-                        f"{selected_customer_id}"
-                    ),
-                )
-
-                updated_rep = st.text_input(
-                    "Assigned Sales Rep",
-                    value=str(
-                        selected_customer[
-                            "assigned_sales_rep"
-                        ]
-                    ),
-                    key=(
-                        "update_rep_"
-                        f"{selected_customer_id}"
-                    ),
-                )
-
-
-            if st.button(
-                "Save Customer Changes",
-                type="primary",
-                use_container_width=True,
-                key=(
-                    "save_customer_"
-                    f"{selected_customer_id}"
-                ),
-            ):
-
-                result = update_customer(
-                    customer_id=
-                        selected_customer_id,
-                    company_name=
-                        updated_company.strip(),
-                    contact_name=
-                        updated_contact.strip(),
-                    phone=
-                        updated_phone.strip(),
-                    account_tier=
-                        updated_tier,
-                    delivery_area=
-                        updated_area.strip(),
-                    assigned_sales_rep=
-                        updated_rep.strip(),
-                )
-
-                if result["success"]:
-
-                    st.success(
-                        f"{selected_customer_id} "
-                        f"updated successfully."
                     )
 
-                    st.rerun()
+                    tier_options = [
+                        "STANDARD",
+                        "GOLD",
+                    ]
 
-                else:
+                    tier_index = (
+                        tier_options.index(
+                            current_tier
+                        )
+                        if current_tier
+                        in tier_options
+                        else 0
+                    )
 
-                    st.error(
-                        f"Could not update customer: "
-                        f"{result['error']}"
+                    updated_tier = st.selectbox(
+                        "Account Tier",
+                        tier_options,
+                        index=tier_index,
+                        key=(
+                            "update_tier_"
+                            f"{selected_customer_id}"
+                        ),
+                    )
+
+                    updated_area = st.text_input(
+                        "Delivery Area",
+                        value=str(
+                            selected_customer[
+                                "delivery_area"
+                            ]
+                        ),
+                        key=(
+                            "update_area_"
+                            f"{selected_customer_id}"
+                        ),
+                    )
+
+                    updated_rep = st.text_input(
+                        "Assigned Sales Rep",
+                        value=str(
+                            selected_customer[
+                                "assigned_sales_rep"
+                            ]
+                        ),
+                        key=(
+                            "update_rep_"
+                            f"{selected_customer_id}"
+                        ),
                     )
 
 
-    # =================================================
-    # REMOVE CUSTOMER
-    # =================================================
+                if st.button(
+                    "Save Customer Changes",
+                    type="primary",
+                    use_container_width=True,
+                    key=(
+                        "save_customer_"
+                        f"{selected_customer_id}"
+                    ),
+                ):
 
-    elif customer_action == "Remove Customer":
+                    result = update_customer(
+                        customer_id=
+                            selected_customer_id,
+                        company_name=
+                            updated_company.strip(),
+                        contact_name=
+                            updated_contact.strip(),
+                        phone=
+                            updated_phone.strip(),
+                        account_tier=
+                            updated_tier,
+                        delivery_area=
+                            updated_area.strip(),
+                        assigned_sales_rep=
+                            updated_rep.strip(),
+                    )
 
-        st.markdown("#### Remove Customer")
+                    if result["success"]:
 
-        st.warning(
-            "Removing a customer is intended for "
-            "prototype administration. Customers with "
-            "dependent transactional records may not "
-            "be removable."
-        )
+                        st.success(
+                            f"{selected_customer_id} "
+                            f"updated successfully."
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            f"Could not update customer: "
+                            f"{result['error']}"
+                        )
 
 
-        if customers_df.empty:
+        # =================================================
+        # REMOVE CUSTOMER
+        # =================================================
 
-            st.info(
-                "There are no customers to remove."
+        elif customer_action == "Remove Customer":
+
+            st.markdown("#### Remove Customer")
+
+            st.warning(
+                "Removing a customer is intended for "
+                "prototype administration. Customers with "
+                "dependent transactional records may not "
+                "be removable."
             )
 
-        else:
 
-            customer_ids = (
-                customers_df[
-                    "customer_id"
-                ].tolist()
-            )
+            if customers_df.empty:
 
-            selected_remove_id = st.selectbox(
-                "Select Customer",
-                customer_ids,
-                key="remove_customer_select",
-            )
+                st.info(
+                    "There are no customers to remove."
+                )
 
-            selected_remove_customer = (
-                customers_df[
+            else:
+
+                customer_ids = (
                     customers_df[
                         "customer_id"
-                    ] == selected_remove_id
-                ]
-                .iloc[0]
-            )
-
-            st.write(
-                "**Company:** "
-                f"{selected_remove_customer['company_name']}"
-            )
-
-            st.write(
-                "**Contact:** "
-                f"{selected_remove_customer['contact_name']}"
-            )
-
-            confirm_remove = st.checkbox(
-                "I confirm that I want to remove "
-                "this customer.",
-                key=(
-                    "confirm_remove_"
-                    f"{selected_remove_id}"
-                ),
-            )
-
-
-            if st.button(
-                "Remove Customer",
-                type="primary",
-                use_container_width=True,
-                disabled=not confirm_remove,
-                key=(
-                    "remove_customer_"
-                    f"{selected_remove_id}"
-                ),
-            ):
-
-                result = remove_customer(
-                    selected_remove_id
+                    ].tolist()
                 )
 
-                if result["success"]:
+                selected_remove_id = st.selectbox(
+                    "Select Customer",
+                    customer_ids,
+                    key="remove_customer_select",
+                )
 
-                    st.success(
-                        f"{selected_remove_id} removed."
+                selected_remove_customer = (
+                    customers_df[
+                        customers_df[
+                            "customer_id"
+                        ] == selected_remove_id
+                    ]
+                    .iloc[0]
+                )
+
+                st.write(
+                    "**Company:** "
+                    f"{selected_remove_customer['company_name']}"
+                )
+
+                st.write(
+                    "**Contact:** "
+                    f"{selected_remove_customer['contact_name']}"
+                )
+
+                confirm_remove = st.checkbox(
+                    "I confirm that I want to remove "
+                    "this customer.",
+                    key=(
+                        "confirm_remove_"
+                        f"{selected_remove_id}"
+                    ),
+                )
+
+
+                if st.button(
+                    "Remove Customer",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not confirm_remove,
+                    key=(
+                        "remove_customer_"
+                        f"{selected_remove_id}"
+                    ),
+                ):
+
+                    result = remove_customer(
+                        selected_remove_id
                     )
 
-                    st.rerun()
+                    if result["success"]:
 
-                else:
+                        st.success(
+                            f"{selected_remove_id} removed."
+                        )
 
-                    st.error(
-                        f"Could not remove customer: "
-                        f"{result['error']}"
-                    )
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            f"Could not remove customer: "
+                            f"{result['error']}"
+                        )
 
 
     # =====================================================
@@ -1638,501 +1551,501 @@ with customer_tab:
 # DELIVERY
 # =====================================================
 
-with delivery_tab:
+    with delivery_tab:
 
-    st.subheader("Delivery Capacity")
+        st.subheader("Delivery Capacity")
 
-    delivery_df = pd.DataFrame(
-        get_table_data(
-            "delivery_slots"
-        )
-    )
-
-
-    # -------------------------------------------------
-    # CURRENT DELIVERY TABLE
-    # -------------------------------------------------
-
-    if not delivery_df.empty:
-
-        delivery_display = delivery_df.rename(
-            columns={
-                "delivery_area": "Area",
-                "delivery_date": "Date",
-                "delivery_fee": "Delivery Fee",
-                "remaining_capacity":
-                    "Remaining Capacity",
-            }
-        )
-
-        st.dataframe(
-            delivery_display,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    else:
-
-        st.info(
-            "No delivery slots currently exist."
+        delivery_df = pd.DataFrame(
+            get_table_data(
+                "delivery_slots"
+            )
         )
 
 
-    st.divider()
+        # -------------------------------------------------
+        # CURRENT DELIVERY TABLE
+        # -------------------------------------------------
 
+        if not delivery_df.empty:
 
-    # =================================================
-    # DELIVERY MANAGEMENT
-    # =================================================
-
-    st.subheader("Manage Delivery Slots")
-
-    delivery_action = st.radio(
-        "Action",
-        [
-            "Add Slot",
-            "Update Capacity",
-            "Remove Slot",
-        ],
-        horizontal=True,
-        key="delivery_action",
-    )
-
-
-    # =================================================
-    # ADD DELIVERY SLOT
-    # =================================================
-
-    if delivery_action == "Add Slot":
-
-        st.markdown("#### Add Delivery Slot")
-
-        add_delivery_col_1, add_delivery_col_2 = (
-            st.columns(2)
-        )
-
-
-        with add_delivery_col_1:
-
-            new_delivery_area = st.text_input(
-                "Delivery Area",
-                placeholder="Tuas",
-                key="new_delivery_area",
+            delivery_display = delivery_df.rename(
+                columns={
+                    "delivery_area": "Area",
+                    "delivery_date": "Date",
+                    "delivery_fee": "Delivery Fee",
+                    "remaining_capacity":
+                        "Remaining Capacity",
+                }
             )
 
-            new_delivery_date = st.date_input(
-                "Delivery Date",
-                key="new_delivery_date",
+            st.dataframe(
+                delivery_display,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        else:
+
+            st.info(
+                "No delivery slots currently exist."
             )
 
 
-        with add_delivery_col_2:
+        st.divider()
 
-            new_delivery_fee = st.number_input(
-                "Delivery Fee",
-                min_value=0.0,
-                value=35.0,
-                step=5.0,
-                key="new_delivery_fee",
+
+        # =================================================
+        # DELIVERY MANAGEMENT
+        # =================================================
+
+        st.subheader("Manage Delivery Slots")
+
+        delivery_action = st.radio(
+            "Action",
+            [
+                "Add Slot",
+                "Update Capacity",
+                "Remove Slot",
+            ],
+            horizontal=True,
+            key="delivery_action",
+        )
+
+
+        # =================================================
+        # ADD DELIVERY SLOT
+        # =================================================
+
+        if delivery_action == "Add Slot":
+
+            st.markdown("#### Add Delivery Slot")
+
+            add_delivery_col_1, add_delivery_col_2 = (
+                st.columns(2)
             )
 
-            new_delivery_capacity = (
-                st.number_input(
-                    "Initial Capacity",
-                    min_value=0,
-                    value=5,
-                    step=1,
-                    key="new_delivery_capacity",
+
+            with add_delivery_col_1:
+
+                new_delivery_area = st.text_input(
+                    "Delivery Area",
+                    placeholder="Tuas",
+                    key="new_delivery_area",
                 )
+
+                new_delivery_date = st.date_input(
+                    "Delivery Date",
+                    key="new_delivery_date",
+                )
+
+
+            with add_delivery_col_2:
+
+                new_delivery_fee = st.number_input(
+                    "Delivery Fee",
+                    min_value=0.0,
+                    value=35.0,
+                    step=5.0,
+                    key="new_delivery_fee",
+                )
+
+                new_delivery_capacity = (
+                    st.number_input(
+                        "Initial Capacity",
+                        min_value=0,
+                        value=5,
+                        step=1,
+                        key="new_delivery_capacity",
+                    )
+                )
+
+
+            if st.button(
+                "Add Delivery Slot",
+                type="primary",
+                use_container_width=True,
+                key="add_delivery_slot_button",
+            ):
+
+                if not new_delivery_area.strip():
+
+                    st.error(
+                        "Please enter a delivery area."
+                    )
+
+                else:
+
+                    result = add_delivery_slot(
+                        delivery_area=
+                            new_delivery_area.strip(),
+                        delivery_date=
+                            new_delivery_date.isoformat(),
+                        delivery_fee=
+                            float(new_delivery_fee),
+                        remaining_capacity=
+                            int(new_delivery_capacity),
+                    )
+
+                    if result["success"]:
+
+                        st.success(
+                            "Delivery slot added "
+                            "successfully."
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            f"Could not add delivery slot: "
+                            f"{result['error']}"
+                        )
+
+
+        # =================================================
+        # UPDATE DELIVERY CAPACITY
+        # =================================================
+
+        elif delivery_action == "Update Capacity":
+
+            st.markdown(
+                "#### Update Delivery Capacity"
             )
 
 
-        if st.button(
-            "Add Delivery Slot",
-            type="primary",
-            use_container_width=True,
-            key="add_delivery_slot_button",
-        ):
+            if delivery_df.empty:
 
-            if not new_delivery_area.strip():
-
-                st.error(
-                    "Please enter a delivery area."
+                st.info(
+                    "There are no delivery slots to update."
                 )
 
             else:
 
-                result = add_delivery_slot(
-                    delivery_area=
-                        new_delivery_area.strip(),
-                    delivery_date=
-                        new_delivery_date.isoformat(),
-                    delivery_fee=
-                        float(new_delivery_fee),
-                    remaining_capacity=
-                        int(new_delivery_capacity),
-                )
+                slot_labels = []
 
-                if result["success"]:
+                slot_lookup = {}
 
-                    st.success(
-                        "Delivery slot added "
-                        "successfully."
+
+                for _, row in delivery_df.iterrows():
+
+                    label = (
+                        f"{row['delivery_area']} — "
+                        f"{row['delivery_date']}"
                     )
 
-                    st.rerun()
-
-                else:
-
-                    st.error(
-                        f"Could not add delivery slot: "
-                        f"{result['error']}"
+                    slot_labels.append(
+                        label
                     )
 
-
-    # =================================================
-    # UPDATE DELIVERY CAPACITY
-    # =================================================
-
-    elif delivery_action == "Update Capacity":
-
-        st.markdown(
-            "#### Update Delivery Capacity"
-        )
+                    slot_lookup[label] = row
 
 
-        if delivery_df.empty:
-
-            st.info(
-                "There are no delivery slots to update."
-            )
-
-        else:
-
-            slot_labels = []
-
-            slot_lookup = {}
-
-
-            for _, row in delivery_df.iterrows():
-
-                label = (
-                    f"{row['delivery_area']} — "
-                    f"{row['delivery_date']}"
-                )
-
-                slot_labels.append(
-                    label
-                )
-
-                slot_lookup[label] = row
-
-
-            selected_slot_label = st.selectbox(
-                "Delivery Slot",
-                slot_labels,
-                key="update_delivery_slot_select",
-            )
-
-            selected_slot = slot_lookup[
-                selected_slot_label
-            ]
-
-
-            st.write(
-                "**Delivery Fee:** "
-                f"S${float(selected_slot['delivery_fee']):,.2f}"
-            )
-
-
-            updated_capacity = st.number_input(
-                "Remaining Capacity",
-                min_value=0,
-                value=int(
-                    selected_slot[
-                        "remaining_capacity"
-                    ]
-                ),
-                step=1,
-                key=(
-                    "update_capacity_"
-                    f"{selected_slot_label}"
-                ),
-            )
-
-
-            if st.button(
-                "Update Capacity",
-                type="primary",
-                use_container_width=True,
-                key="update_delivery_capacity_button",
-            ):
-
-                result = (
-                    update_delivery_capacity(
-                        selected_slot[
-                            "delivery_area"
-                        ],
-                        selected_slot[
-                            "delivery_date"
-                        ],
-                        int(
-                            updated_capacity
-                        ),
-                    )
-                )
-
-                if result["success"]:
-
-                    st.success(
-                        "Delivery capacity updated."
-                    )
-
-                    st.rerun()
-
-                else:
-
-                    st.error(
-                        f"Could not update capacity: "
-                        f"{result['error']}"
-                    )
-
-
-    # =================================================
-    # REMOVE DELIVERY SLOT
-    # =================================================
-
-    elif delivery_action == "Remove Slot":
-
-        st.markdown(
-            "#### Remove Delivery Slot"
-        )
-
-
-        if delivery_df.empty:
-
-            st.info(
-                "There are no delivery slots to remove."
-            )
-
-        else:
-
-            slot_labels = []
-
-            slot_lookup = {}
-
-
-            for _, row in delivery_df.iterrows():
-
-                label = (
-                    f"{row['delivery_area']} — "
-                    f"{row['delivery_date']}"
-                )
-
-                slot_labels.append(
-                    label
-                )
-
-                slot_lookup[label] = row
-
-
-            selected_remove_slot_label = (
-                st.selectbox(
+                selected_slot_label = st.selectbox(
                     "Delivery Slot",
                     slot_labels,
-                    key="remove_delivery_slot_select",
+                    key="update_delivery_slot_select",
                 )
-            )
 
-            selected_remove_slot = (
-                slot_lookup[
-                    selected_remove_slot_label
+                selected_slot = slot_lookup[
+                    selected_slot_label
                 ]
-            )
 
 
-            st.write(
-                "**Area:** "
-                f"{selected_remove_slot['delivery_area']}"
-            )
-
-            st.write(
-                "**Date:** "
-                f"{selected_remove_slot['delivery_date']}"
-            )
-
-            st.write(
-                "**Remaining Capacity:** "
-                f"{selected_remove_slot['remaining_capacity']}"
-            )
-
-
-            confirm_remove_slot = st.checkbox(
-                "I confirm that I want to remove "
-                "this delivery slot.",
-                key=(
-                    "confirm_remove_delivery_"
-                    f"{selected_remove_slot_label}"
-                ),
-            )
-
-
-            if st.button(
-                "Remove Delivery Slot",
-                type="primary",
-                use_container_width=True,
-                disabled=not confirm_remove_slot,
-                key="remove_delivery_slot_button",
-            ):
-
-                result = remove_delivery_slot(
-                    delivery_area=
-                        selected_remove_slot[
-                            "delivery_area"
-                        ],
-                    delivery_date=
-                        selected_remove_slot[
-                            "delivery_date"
-                        ],
+                st.write(
+                    "**Delivery Fee:** "
+                    f"S${float(selected_slot['delivery_fee']):,.2f}"
                 )
 
-                if result["success"]:
 
-                    st.success(
-                        "Delivery slot removed."
+                updated_capacity = st.number_input(
+                    "Remaining Capacity",
+                    min_value=0,
+                    value=int(
+                        selected_slot[
+                            "remaining_capacity"
+                        ]
+                    ),
+                    step=1,
+                    key=(
+                        "update_capacity_"
+                        f"{selected_slot_label}"
+                    ),
+                )
+
+
+                if st.button(
+                    "Update Capacity",
+                    type="primary",
+                    use_container_width=True,
+                    key="update_delivery_capacity_button",
+                ):
+
+                    result = (
+                        update_delivery_capacity(
+                            selected_slot[
+                                "delivery_area"
+                            ],
+                            selected_slot[
+                                "delivery_date"
+                            ],
+                            int(
+                                updated_capacity
+                            ),
+                        )
                     )
 
-                    st.rerun()
+                    if result["success"]:
 
-                else:
+                        st.success(
+                            "Delivery capacity updated."
+                        )
 
-                    st.error(
-                        f"Could not remove delivery slot: "
-                        f"{result['error']}"
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            f"Could not update capacity: "
+                            f"{result['error']}"
+                        )
+
+
+        # =================================================
+        # REMOVE DELIVERY SLOT
+        # =================================================
+
+        elif delivery_action == "Remove Slot":
+
+            st.markdown(
+                "#### Remove Delivery Slot"
+            )
+
+
+            if delivery_df.empty:
+
+                st.info(
+                    "There are no delivery slots to remove."
+                )
+
+            else:
+
+                slot_labels = []
+
+                slot_lookup = {}
+
+
+                for _, row in delivery_df.iterrows():
+
+                    label = (
+                        f"{row['delivery_area']} — "
+                        f"{row['delivery_date']}"
                     )
+
+                    slot_labels.append(
+                        label
+                    )
+
+                    slot_lookup[label] = row
+
+
+                selected_remove_slot_label = (
+                    st.selectbox(
+                        "Delivery Slot",
+                        slot_labels,
+                        key="remove_delivery_slot_select",
+                    )
+                )
+
+                selected_remove_slot = (
+                    slot_lookup[
+                        selected_remove_slot_label
+                    ]
+                )
+
+
+                st.write(
+                    "**Area:** "
+                    f"{selected_remove_slot['delivery_area']}"
+                )
+
+                st.write(
+                    "**Date:** "
+                    f"{selected_remove_slot['delivery_date']}"
+                )
+
+                st.write(
+                    "**Remaining Capacity:** "
+                    f"{selected_remove_slot['remaining_capacity']}"
+                )
+
+
+                confirm_remove_slot = st.checkbox(
+                    "I confirm that I want to remove "
+                    "this delivery slot.",
+                    key=(
+                        "confirm_remove_delivery_"
+                        f"{selected_remove_slot_label}"
+                    ),
+                )
+
+
+                if st.button(
+                    "Remove Delivery Slot",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not confirm_remove_slot,
+                    key="remove_delivery_slot_button",
+                ):
+
+                    result = remove_delivery_slot(
+                        delivery_area=
+                            selected_remove_slot[
+                                "delivery_area"
+                            ],
+                        delivery_date=
+                            selected_remove_slot[
+                                "delivery_date"
+                            ],
+                    )
+
+                    if result["success"]:
+
+                        st.success(
+                            "Delivery slot removed."
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            f"Could not remove delivery slot: "
+                            f"{result['error']}"
+                        )
 # HAFIZAH: ADDED AI COMMERCIAL AUTHORITY
 # =========================================================
 # AI COMMERCIAL AUTHORITY
 # =========================================================
 
-with policy_tab:
-    st.subheader("🛡️ AI Commercial Authority")
-    st.caption(
-        "Configure the commercial limits that the AI Sales "
-        "Agent may approve without human intervention."
-    )
-    policies = get_commercial_policies()
+    with policy_tab:
+        st.subheader("🛡️ AI Commercial Authority")
+        st.caption(
+            "Configure the commercial limits that the AI Sales "
+            "Agent may approve without human intervention."
+        )
+        policies = get_commercial_policies()
 
-    policy_lookup = {
-        policy["policy_key"]: policy
-        for policy in policies
-    }
+        policy_lookup = {
+            policy["policy_key"]: policy
+            for policy in policies
+        }
 
-    max_quantity= float(policy_lookup["MAX_QUANTITY_PER_SKU"]["policy_value"])
+        max_quantity= float(policy_lookup["MAX_QUANTITY_PER_SKU"]["policy_value"])
 
-    max_order_value = float(policy_lookup["MAX_ORDER_VALUE"]["policy_value"])
+        max_order_value = float(policy_lookup["MAX_ORDER_VALUE"]["policy_value"])
 
-    max_discount = float(policy_lookup["MAX_DISCOUNT_PERCENT"]["policy_value"])
+        max_discount = float(policy_lookup["MAX_DISCOUNT_PERCENT"]["policy_value"])
 
-    st.info(
-        "Transactions exceeding any of these limits "
-        "require human approval."
-    )
-
-    st.markdown("#### Current Authority Limits")
-
-    quantity_col, value_col, discount_col = st.columns(3)
-
-    with quantity_col:
-        st.metric(
-            "Maximum Quantity / SKU",
-            f"{max_quantity:,.0f}"
+        st.info(
+            "Transactions exceeding any of these limits "
+            "require human approval."
         )
 
-    with value_col:
-        st.metric(
-            "Maximum Order Value",
-            f"S${max_order_value:,.2f}"
-        )
+        st.markdown("#### Current Authority Limits")
 
-    with discount_col:
-        st.metric(
-            "Maximum Discount",
-            f"{max_discount:.1f}"
-        )
+        quantity_col, value_col, discount_col = st.columns(3)
 
-    st.divider()
-
-    st.markdown("#### Update Authority Limits")
-
-    new_max_quantity = st.number_input(
-        "Maximum Quantity per SKU",
-        min_value=1,
-        value=int(max_quantity),
-        step=1,
-        help=(
-            "Orders above this quantity require "
-            "human approval."
-        ),
-    )
-
-    new_max_order_value = st.number_input(
-        "Maximum Order Value (S$)",
-        min_value=0.0,
-        value=max_order_value,
-        step=500.0,
-        help=(
-            "Orders above this value require "
-            "human approval."
-        )
-    )
-
-    new_max_discount = st.number_input(
-        "Maximum Discount (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=max_discount,
-        step=1.0,
-        help=(
-            "Discounts above this percentage require "
-            "human approval."
-        ),
-    )
-
-    if st.button(
-        "Save Authority Limits",
-        type="primary",
-        use_container_width=True,
-        key="save_commercial_authority"
-    ):
-        results = [
-            update_commercial_policy(
-                "MAX_QUANTITY_PER_SKU",
-                float(new_max_quantity),
-            ),
-            update_commercial_policy(
-                "MAX_ORDER_VALUE",
-                float(new_max_order_value),
-            ),
-            update_commercial_policy(
-                "MAX_DISCOUNT_PERCENT",
-                float(new_max_discount),
-            ),
-        ]
-
-        if all(result["success"] for result in results):
-            st.success(
-                "AI commercial authority updated successfully."
-            )
-            st.rerun()
-
-        else:
-            st.error(
-                "One or more commercial authority "
-                "settings could not be updated."
+        with quantity_col:
+            st.metric(
+                "Maximum Quantity / SKU",
+                f"{max_quantity:,.0f}"
             )
 
-# =========================================================
+        with value_col:
+            st.metric(
+                "Maximum Order Value",
+                f"S${max_order_value:,.2f}"
+            )
+
+        with discount_col:
+            st.metric(
+                "Maximum Discount",
+                f"{max_discount:.1f}"
+            )
+
+        st.divider()
+
+        st.markdown("#### Update Authority Limits")
+
+        new_max_quantity = st.number_input(
+            "Maximum Quantity per SKU",
+            min_value=1,
+            value=int(max_quantity),
+            step=1,
+            help=(
+                "Orders above this quantity require "
+                "human approval."
+            ),
+        )
+
+        new_max_order_value = st.number_input(
+            "Maximum Order Value (S$)",
+            min_value=0.0,
+            value=max_order_value,
+            step=500.0,
+            help=(
+                "Orders above this value require "
+                "human approval."
+            )
+        )
+
+        new_max_discount = st.number_input(
+            "Maximum Discount (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=max_discount,
+            step=1.0,
+            help=(
+                "Discounts above this percentage require "
+                "human approval."
+            ),
+        )
+
+        if st.button(
+            "Save Authority Limits",
+            type="primary",
+            use_container_width=True,
+            key="save_commercial_authority"
+        ):
+            results = [
+                update_commercial_policy(
+                    "MAX_QUANTITY_PER_SKU",
+                    float(new_max_quantity),
+                ),
+                update_commercial_policy(
+                    "MAX_ORDER_VALUE",
+                    float(new_max_order_value),
+                ),
+                update_commercial_policy(
+                    "MAX_DISCOUNT_PERCENT",
+                    float(new_max_discount),
+                ),
+            ]
+
+            if all(result["success"] for result in results):
+                st.success(
+                    "AI commercial authority updated successfully."
+                )
+                st.rerun()
+
+            else:
+                st.error(
+                    "One or more commercial authority "
+                    "settings could not be updated."
+                )
+
+    # =========================================================
 # TAB 3 — SALESOPS
 # =========================================================
 
@@ -2157,7 +2070,7 @@ with dashboard_tab:
     # KPI CARDS
     # =====================================================
 
-    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+    metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
 
     with metric_1:
         st.metric(
@@ -2167,17 +2080,23 @@ with dashboard_tab:
 
     with metric_2:
         st.metric(
-            "Human Escalations",
-            metrics["human_escalations"]
+            "Approvals Required",
+            metrics["approvals_required"]
         )
 
     with metric_3:
+        st.metric(
+            "Salesperson Requested",
+            metrics["salesperson_requested"]
+        )
+
+    with metric_4:
         st.metric(
             "Orders Confirmed",
             metrics["orders_confirmed"]
         )
 
-    with metric_4:
+    with metric_5:
         st.metric(
             "Revenue Generated",
             f"S${metrics['revenue']:,.2f}"
@@ -2193,37 +2112,30 @@ with dashboard_tab:
 
     st.subheader("🤖 AI Automation")
 
-    automation_col_1, automation_col_2 = st.columns(2)
+    st.metric(
+        "Customer Messages Handled",
+        metrics["customer_messages"]
+    )
 
-    with automation_col_1:
-        st.metric(
-            "Customer Messages Handled",
-            metrics["customer_messages"]
-        )
-
-    with automation_col_2:
-        st.metric(
-            "Human Decisions Required",
-            metrics["human_escalations"]
-        )
-
-
-    if (
-        metrics["customer_messages"] > 0
-        and metrics["human_escalations"] == 0
-    ):
-
-        st.success(
-            "Routine customer interaction is being "
-            "handled autonomously."
-        )
-
-    elif metrics["human_escalations"] > 0:
+    if metrics["approvals_required"] > 0:
 
         st.warning(
-            "The AI handled the conversation until "
-            "a commercial authority boundary required "
-            "human judgement."
+            "One or more commercial approvals "
+            "require attention."
+        )
+
+    elif metrics["salesperson_requested"] > 0:
+
+        st.info(
+            "A customer has requested follow-up "
+            "from a salesperson."
+        )
+
+    elif metrics["customer_messages"] > 0:
+
+        st.success(
+            "Customer interactions are being "
+            "handled autonomously."
         )
 
     else:
@@ -2231,13 +2143,6 @@ with dashboard_tab:
         st.info(
             "Waiting for WhatsApp sales activity."
         )
-
-
-    st.caption(
-        "Human intervention is triggered only when "
-        "business policy requires a human decision."
-    )
-
 
     st.divider()
 
@@ -2323,6 +2228,31 @@ with dashboard_tab:
 
                     if details:
                         st.write(details)
+
+
+            # =============================================
+            # SALESPERSON REQUESTED
+            # =============================================
+
+            elif (
+                event_type
+                == "HUMAN_HANDOFF_REQUESTED"
+            ):
+
+                with st.container(border=True):
+
+                    st.markdown(
+                        "### 👤 Salesperson Requested"
+                    )
+
+                    st.caption(timestamp)
+
+                    st.write(
+                        f"**Customer:** {phone}"
+                    )
+
+                    if details:
+                        st.info(details)
 
 
             # =============================================
@@ -2428,11 +2358,18 @@ with dashboard_tab:
             f"in confirmed orders during this demo."
         )
 
-    elif metrics["human_escalations"] > 0:
+    elif metrics["approvals_required"] > 0:
 
         st.warning(
-            "A commercial decision currently "
+            "A commercial approval currently "
             "requires human attention."
+        )
+
+    elif metrics["salesperson_requested"] > 0:
+
+        st.info(
+            "A customer has requested follow-up "
+            "from a salesperson."
         )
 
     elif metrics["conversations"] > 0:

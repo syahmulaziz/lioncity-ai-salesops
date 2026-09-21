@@ -676,6 +676,107 @@ def get_table_data(table_name: str):
         for row in rows
     ]
 
+def add_product_with_inventory(
+    sku: str,
+    product_name: str,
+    description: str,
+    category: str,
+    list_price: float,
+    available_quantity: int,
+):
+    """
+    Add a new product and its initial inventory
+    as one database transaction.
+    """
+
+    sku = sku.strip().upper()
+    product_name = product_name.strip()
+    description = description.strip()
+    category = category.strip()
+
+    if not sku or not product_name:
+        return {
+            "success": False,
+            "error": "SKU_AND_PRODUCT_NAME_REQUIRED",
+        }
+
+    if list_price < 0:
+        return {
+            "success": False,
+            "error": "INVALID_LIST_PRICE",
+        }
+
+    if available_quantity < 0:
+        return {
+            "success": False,
+            "error": "INVALID_QUANTITY",
+        }
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute("""
+            INSERT INTO products (
+                sku,
+                product_name,
+                description,
+                category,
+                list_price
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            sku,
+            product_name,
+            description,
+            category,
+            list_price,
+        ))
+
+        cursor.execute("""
+            INSERT INTO inventory (
+                sku,
+                available_quantity
+            )
+            VALUES (?, ?)
+        """, (
+            sku,
+            available_quantity,
+        ))
+
+        connection.commit()
+
+        return {
+            "success": True,
+            "sku": sku,
+            "product_name": product_name,
+            "available_quantity": available_quantity,
+        }
+
+    except sqlite3.IntegrityError:
+
+        connection.rollback()
+
+        return {
+            "success": False,
+            "error": "SKU_ALREADY_EXISTS",
+            "sku": sku,
+        }
+
+    except Exception as error:
+
+        connection.rollback()
+
+        return {
+            "success": False,
+            "error": str(error),
+        }
+
+    finally:
+
+        connection.close()
+
 def update_inventory(
     sku: str,
     available_quantity: int
@@ -1035,22 +1136,6 @@ def reset_demo_data():
     """)
 
     # -------------------------------------------------
-    # Restore hero-demo inventory.
-    # -------------------------------------------------
-
-    inventory_values = [
-        (486, "CBL-210"),
-        (121, "ADP-120"),
-        (670, "TIE-100"),
-    ]
-
-    cursor.executemany("""
-        UPDATE inventory
-        SET available_quantity = ?
-        WHERE sku = ?
-    """, inventory_values)
-
-    # -------------------------------------------------
     # Restore hero-demo delivery capacity.
     # -------------------------------------------------
 
@@ -1241,7 +1326,7 @@ def get_sales_metrics():
 
 
     # ---------------------------------------------
-    # HUMAN ESCALATIONS
+    # APPROVALS REQUIRED
     # ---------------------------------------------
 
     cursor.execute("""
@@ -1250,8 +1335,20 @@ def get_sales_metrics():
         WHERE event_type = 'HUMAN_APPROVAL_REQUIRED'
     """)
 
-    escalations = cursor.fetchone()[0]
+    approvals_required = cursor.fetchone()[0]
 
+
+    # ---------------------------------------------
+    # SALESPERSON REQUESTED
+    # ---------------------------------------------
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM sales_events
+        WHERE event_type = 'HUMAN_HANDOFF_REQUESTED'
+    """)
+
+    salesperson_requested = cursor.fetchone()[0]
 
     # ---------------------------------------------
     # CONFIRMED ORDERS
@@ -1285,7 +1382,8 @@ def get_sales_metrics():
     return {
         "conversations": conversations,
         "customer_messages": customer_messages,
-        "human_escalations": escalations,
+        "approvals_required": approvals_required,
+        "salesperson_requested": salesperson_requested,
         "orders_confirmed": orders,
         "revenue": float(revenue),
     }
