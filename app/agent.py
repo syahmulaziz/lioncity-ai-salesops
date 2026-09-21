@@ -1951,6 +1951,21 @@ class SalesAgent:
                 pending_order,
             )
 
+            # TEMPORARY DEBUGGING:
+            # Show exactly what was retried after human approval
+            # and why order creation succeeded/failed.
+            print("\n" + "=" * 60)
+            print("POST-APPROVAL ORDER CREATION DEBUG")
+            print("=" * 60)
+
+            print("PENDING ORDER:")
+            print(pending_order)
+
+            print("\nORDER RESULT:")
+            print(order_result)
+
+            print("=" * 60)
+
             if order_result.get("success"):
 
                 # Clear only after successful persistence.
