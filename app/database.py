@@ -665,9 +665,19 @@ def get_table_data(table_name: str):
     connection = get_connection()
     cursor = connection.cursor()
 
-    cursor.execute(
-        f"SELECT * FROM {table_name}"
-    )
+    if table_name == "orders":
+
+        cursor.execute("""
+            SELECT *
+            FROM orders
+            ORDER BY order_date DESC, order_id DESC
+        """)
+
+    else:
+
+        cursor.execute(
+            f"SELECT * FROM {table_name}"
+        )
 
     rows = cursor.fetchall()
 
@@ -996,6 +1006,34 @@ def create_approval_request(
         "reason": reason,
     }
 
+def get_customer_by_phone(
+    phone: str
+):
+    """
+    Return the current customer record matching a
+    WhatsApp phone number.
+
+    Used by dashboards to resolve customer information
+    from the authoritative customers table.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM customers
+        WHERE phone = ?
+        LIMIT 1
+    """, (
+        phone,
+    ))
+
+    row = cursor.fetchone()
+
+    connection.close()
+
+    return dict(row) if row else None
 
 def get_pending_approvals():
     connection = get_connection()
@@ -1671,10 +1709,7 @@ def get_latest_sales_state():
 
     if (
         approval
-        and approval["status"] in (
-            "PENDING",
-            "APPROVED",
-        )
+        and approval["status"] == "PENDING"
     ):
 
         return {

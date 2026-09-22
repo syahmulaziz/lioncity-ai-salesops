@@ -21,6 +21,7 @@ from app.database import (
     get_commercial_policies,
     update_commercial_policy,
     add_product_with_inventory,
+    get_customer_by_phone,
 )
 
 
@@ -444,6 +445,10 @@ with sales_tab:
                     "DISCOUNT"
                 )
 
+                customer = get_customer_by_phone(
+                    request["phone"]
+                )
+
                 with st.container(
                     border=True
                 ):
@@ -457,9 +462,14 @@ with sales_tab:
                     else:
                         st.markdown("### Discount Request")
 
+                    company_name = (
+                        customer["company_name"]
+                        if customer
+                        else "Unknown customer"
+                    )
+
                     st.write(
-                        "**Company:** "
-                        "Apex Engineering Pte Ltd"
+                        f"**Company:** {company_name}"
                     )
 
                     st.write(
