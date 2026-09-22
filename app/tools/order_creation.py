@@ -1,4 +1,5 @@
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from app.database import get_connection, log_sales_event
 
 
@@ -19,7 +20,13 @@ def create_order(
     LionCity database before success is returned.
     """
 
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    singapore_now = datetime.now(
+        ZoneInfo("Asia/Singapore")
+    )
+
+    timestamp = singapore_now.strftime(
+        "%Y%m%d%H%M%S%f"
+    )
 
     order_id = f"SO-DEMO-{timestamp}"
 
@@ -40,7 +47,7 @@ def create_order(
         """, (
             order_id,
             customer_id,
-            datetime.now().strftime("%Y-%m-%d"),
+            singapore_now.strftime("%Y-%m-%d"),
             delivery_area,
             "CONFIRMED",
         ))
