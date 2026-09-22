@@ -997,6 +997,15 @@ class SalesAgent:
         # Human-in-the-loop state
         self.pending_approval = None
 
+        # Human-approved discount for the CURRENT sales
+        # transaction/conversation.
+        #
+        # This is trusted application state populated only by
+        # apply_human_approval(). It prevents the same approved
+        # discount from being escalated a second time during
+        # final commercial-authority/order checks.
+        self.approved_discount_percent = None
+
         # Commercial order waiting for human authority approval.
         #
         # Unlike pending_approval (legacy discount HITL), this stores
@@ -1102,6 +1111,74 @@ class SalesAgent:
 
         self.activity_log.append(entry)
 
+    def _apply_trusted_discount_approval(
+        self,
+        authority_result: dict,
+        discount_percent: float,
+    ):
+        """
+        Remove EXCESSIVE_DISCOUNT from a commercial-authority
+        result when this exact discount was already approved by
+        a human during the current sales transaction.
+
+        Other authority reasons such as HIGH_QUANTITY or
+        HIGH_VALUE remain fully enforced.
+        """
+
+        if not isinstance(authority_result, dict):
+            return authority_result
+
+        approved_discount = getattr(
+            self,
+            "approved_discount_percent",
+            None,
+        )
+
+        if approved_discount is None:
+            return authority_result
+
+        try:
+            same_discount = (
+                abs(
+                    float(discount_percent)
+                    - float(approved_discount)
+                )
+                < 0.01
+            )
+        except (TypeError, ValueError):
+            return authority_result
+
+        if not same_discount:
+            return authority_result
+
+        reasons = list(
+            authority_result.get("reasons", [])
+        )
+
+        if "EXCESSIVE_DISCOUNT" not in reasons:
+            return authority_result
+
+        remaining_reasons = [
+            reason
+            for reason in reasons
+            if reason != "EXCESSIVE_DISCOUNT"
+        ]
+
+        authority_result = dict(authority_result)
+        authority_result["reasons"] = remaining_reasons
+
+        # Human approval covers ONLY the discount reason.
+        # Any remaining quantity/value reason still requires HITL.
+        authority_result["requires_human_approval"] = bool(
+            remaining_reasons
+        )
+
+        authority_result[
+            "discount_human_approved"
+        ] = True
+
+        return authority_result
+
     # =================================================================
     # PERSON 1 ENHANCEMENT: enquiry-state + triage integration helpers
     # =================================================================
@@ -1195,19 +1272,6 @@ class SalesAgent:
             return result
 
         if tool_name == "check_delivery":
-            # DETERMINISTIC DELIVERY GROUNDING (Python-enforced, not
-            # prompt-only). Run the trusted tool, then normalise the result so
-            # a delivery fee is marked verified ONLY when the slot is available
-            # AND a real numeric fee was returned. An unverified/unavailable
-            # result carries NO usable fee and cannot become 0. We also record
-            # a per-turn signal used by the final-response safety guard, and
-            # retain the full normalised result for THIS response cycle so the
-            # shared finalizer can bind the reply to the EXACT checked
-            # area/date/availability/fee rather than trust Claude's draft.
-            #
-            # A tool-execution failure still marks this cycle as having an
-            # unverified delivery attempt (never silently "no check happened"),
-            # so the finalizer stays safe even if the underlying tool raises.
             requested_area = (
                 tool_input.get("delivery_area")
                 if isinstance(tool_input, dict) else None
@@ -1348,6 +1412,144 @@ class SalesAgent:
             if isinstance(result, dict):
                 self._quotation_result_this_cycle = result
             return result
+
+        # -------------------------------------------------
+        # SCRUM-29: TRUSTED HUMAN-APPROVED DISCOUNT
+        # -------------------------------------------------
+
+        if tool_name == "evaluate_commercial_authority":
+            result = execute_tool(tool_name, tool_input)
+            return self._apply_trusted_discount_approval(
+                result,
+                tool_input.get("discount_percent"),
+            )
+
+        if tool_name == "create_order":
+            approved_discount = getattr(
+                self,
+                "approved_discount_percent",
+                None,
+            )
+            discount_percent = tool_input.get("discount_percent")
+            discount_already_approved = False
+
+            if approved_discount is not None:
+                try:
+                    discount_already_approved = (
+                        abs(
+                            float(discount_percent)
+                            - float(approved_discount)
+                        )
+                        < 0.01
+                    )
+                except (TypeError, ValueError):
+                    discount_already_approved = False
+
+            if discount_already_approved:
+                # Re-check authority with ONLY the already-approved
+                # discount neutralised. Quantity/value limits remain active.
+                remaining_authority_required = False
+
+                for item in tool_input["items"]:
+                    authority_result = evaluate_commercial_authority(
+                        item["sku"],
+                        item["quantity"],
+                        tool_input["final_total"],
+                        0.0,
+                    )
+
+                    if not authority_result.get("success"):
+                        return authority_result
+
+                    if authority_result.get("requires_human_approval"):
+                        remaining_authority_required = True
+                        break
+
+                if remaining_authority_required:
+                    # The human-approved discount is no longer an authority
+                    # issue, but another authority dimension (for example
+                    # HIGH_QUANTITY or HIGH_VALUE) still requires HITL.
+                    #
+                    # Do NOT fall through to module-level execute_tool(),
+                    # because that would re-evaluate the original discount
+                    # and incorrectly raise EXCESSIVE_DISCOUNT again.
+                    approval_result = create_approval_request(
+                        phone=tool_input["phone"],
+                        requested_percent=tool_input["discount_percent"],
+                        approval_type="COMMERCIAL_AUTHORITY",
+                        sku=tool_input["items"][0]["sku"],
+                        requested_quantity=tool_input["items"][0]["quantity"],
+                        order_value=tool_input["final_total"],
+                        reason=",".join(
+                            authority_result.get("reasons", [])
+                        ),
+                    )
+
+                    # Customer has already explicitly confirmed because the
+                    # create_order tool is being invoked. Preserve the exact
+                    # transaction for SCRUM-19 deterministic resume after
+                    # the remaining commercial approval is granted.
+                    self.pending_commercial_order = dict(tool_input)
+
+                    self.log_activity(
+                        "commercial_order_pending_approval",
+                        "Confirmed order waiting for commercial approval",
+                        self.pending_commercial_order.copy(),
+                    )
+
+                    return {
+                        "success": False,
+                        "error": "HUMAN_APPROVAL_REQUIRED",
+                        "message": (
+                            "This transaction requires human approval "
+                            "before the order can be created."
+                        ),
+                        "reasons": authority_result.get("reasons", []),
+                        "approval": approval_result,
+                    }
+
+                if not remaining_authority_required:
+                    order_result = create_order(
+                        customer_id=tool_input["customer_id"],
+                        items=tool_input["items"],
+                        product_subtotal=tool_input["product_subtotal"],
+                        discount_percent=tool_input["discount_percent"],
+                        delivery_fee=tool_input["delivery_fee"],
+                        final_total=tool_input["final_total"],
+                        delivery_area=tool_input["delivery_area"],
+                        delivery_date=tool_input["delivery_date"],
+                    )
+
+                    if not order_result.get("success"):
+                        log_sales_event(
+                            event_type="ORDER_CREATION_FAILED",
+                            phone=tool_input["phone"],
+                            customer_id=tool_input["customer_id"],
+                            amount=tool_input["final_total"],
+                            details=(
+                                "Order creation failed after customer "
+                                "confirmation. Human follow-up required. "
+                                f"Reason: "
+                                f"{order_result.get('message') or order_result.get('error')}"
+                            ),
+                        )
+
+                    self._ingest_tool_side_effects(
+                        tool_name,
+                        order_result,
+                    )
+
+                    if order_result.get("success"):
+                        self._order_result_this_cycle = order_result
+
+                        if not getattr(
+                            self,
+                            "_suppress_order_completion_reset",
+                            False,
+                        ):
+                            self._end_current_transaction()
+
+                    return order_result
 
         # TRUSTED PATH: run the existing business tool unchanged.
         result = execute_tool(tool_name, tool_input)
@@ -1781,6 +1983,11 @@ class SalesAgent:
             enquiry, "reset_after_order_completion"
         ):
             enquiry.reset_after_order_completion()
+
+        # A human-approved discount belongs only to the
+        # completed sales transaction. Never carry it into
+        # the customer's next order.
+        self.approved_discount_percent = None
 
     def _render_proceed_prompt(self):
         """
@@ -2340,38 +2547,7 @@ class SalesAgent:
             }
         )
 
-        self.messages.append({
-            "role": "user",
-            "content": (
-                "[TRUSTED HUMAN COMMERCIAL AUTHORITY APPROVAL]\n"
-                "A sales representative has reviewed and approved "
-                "the proposed commercial transaction.\n"
-                f"SKU: {sku}\n"
-                f"Quantity: {requested_quantity}\n"
-                f"Order value: {order_value}\n"
-                f"Discount: {requested_percent}%\n\n"
-
-                "The customer had already explicitly confirmed that "
-                "they wanted to proceed with this order before the "
-                "commercial authority approval was requested.\n\n"
-
-                "The transaction now has human approval to proceed "
-                "despite exceeding the AI Sales Agent's normal "
-                "commercial authority.\n\n"
-
-                "Resume the interrupted order-creation flow now. "
-                "Do not ask the customer to confirm the same order again. "
-                "Re-evaluate commercial authority using the approved "
-                "transaction details and, once the approval is recognised, "
-                "use the create_order tool to create the order.\n\n"
-
-                "Do not claim that the order has been created unless "
-                "create_order returns success. "
-                "Do not change the approved quantity, order value, "
-                "discount, delivery details, or other confirmed "
-                "transaction details."
-            )
-        })
+        
 
         # Reset response-cycle grounding before resuming the
         # approved commercial transaction.
@@ -2384,6 +2560,30 @@ class SalesAgent:
         # relying on the LLM to reconstruct transaction details
         # from conversation history.
         if self.pending_commercial_order is not None:
+            # -------------------------------------------------
+            # POST-CONFIRMATION APPROVAL
+            #
+            # pending_commercial_order exists ONLY because the
+            # customer already confirmed and create_order was
+            # subsequently blocked by commercial authority.
+            # It is therefore safe to resume that exact order
+            # without asking the customer to confirm again.
+            # -------------------------------------------------
+
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    "[TRUSTED HUMAN COMMERCIAL AUTHORITY APPROVAL]\n"
+                    "A sales representative has approved the "
+                    "commercial transaction.\n\n"
+                    "The customer had already explicitly confirmed "
+                    "that they wanted to proceed before order creation "
+                    "was blocked by commercial authority.\n\n"
+                    "Resume the exact previously confirmed transaction. "
+                    "Do not ask the customer to confirm it again."
+                )
+            })
+
             pending_order = self.pending_commercial_order.copy()
 
             # -------------------------------------------------
@@ -2561,8 +2761,35 @@ class SalesAgent:
                 "order_result": order_result,
             }
 
-        # Backward-compatible fallback for commercial approvals
-        # that were created before pending order state existed.
+        # -------------------------------------------------
+        # PRE-CONFIRMATION APPROVAL
+        #
+        # There is no pending_commercial_order, therefore
+        # create_order has NOT previously been blocked after
+        # customer confirmation.
+        #
+        # Human approval authorises the commercial terms only.
+        # It does NOT constitute customer acceptance.
+        # -------------------------------------------------
+
+        self.messages.append({
+            "role": "user",
+            "content": (
+                "[TRUSTED HUMAN COMMERCIAL AUTHORITY APPROVAL]\n"
+                "A sales representative has approved the proposed "
+                "commercial transaction.\n\n"
+                "IMPORTANT: The customer has NOT yet confirmed that "
+                "they want to place the order.\n"
+                "Human approval authorises the commercial terms only; "
+                "it does NOT constitute customer acceptance.\n\n"
+                "Do NOT create an order now. "
+                "Do NOT claim that an order has been created. "
+                "Tell the customer that the commercial terms have been "
+                "approved and ask whether they would like to proceed "
+                "with the order."
+            )
+        })
+
         return self._continue_after_human_action()
 
     def apply_human_approval(
@@ -2605,6 +2832,13 @@ class SalesAgent:
         self.pending_approval[
             "approved_discount_percent"
         ] = approved_discount_percent
+
+        # Persist the trusted human-approved discount for this
+        # sales transaction so later commercial-authority checks
+        # do not escalate the same discount again.
+        self.approved_discount_percent = (
+            approved_discount_percent
+        )
 
         self.log_activity(
             "human_approval",
