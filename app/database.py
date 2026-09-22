@@ -129,7 +129,8 @@ def create_tables():
             sku TEXT,
             requested_quantity INTEGER,
             order_value REAL,
-            reason TEXT
+            reason TEXT,
+            order_id TEXT
         )
     """)
 
@@ -150,6 +151,7 @@ def create_tables():
         "requested_quantity": "INTEGER",
         "order_value": "REAL",
         "reason": "TEXT",
+        "order_id": "TEXT",
     }
 
     for column_name, column_type in approval_columns.items():
@@ -1117,6 +1119,61 @@ def mark_approval_processed(
 
     connection.commit()
     connection.close()
+
+def set_approval_order_id(
+    approval_id: int,
+    order_id: str
+):
+    """
+    Associate a successfully persisted order with the
+    commercial approval that authorised it.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        UPDATE approval_requests
+        SET order_id = ?
+        WHERE approval_id = ?
+    """, (
+        order_id,
+        approval_id,
+    ))
+
+    connection.commit()
+    changed = cursor.rowcount
+    connection.close()
+
+    return {
+        "success": changed == 1,
+        "approval_id": approval_id,
+        "order_id": order_id,
+    }
+
+
+def get_approval_by_id(
+    approval_id: int
+):
+    """
+    Retrieve one approval request by ID.
+    """
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM approval_requests
+        WHERE approval_id = ?
+    """, (
+        approval_id,
+    ))
+
+    row = cursor.fetchone()
+    connection.close()
+
+    return dict(row) if row else None
 
 def reset_demo_data():
     """

@@ -109,8 +109,10 @@ def test_process_commercial_approval_resumes_and_sends_whatsapp(
         == "Your approved transaction can proceed."
     )
 
-    # Approval was consumed only after successful processing.
-    assert processed_ids == [approval_id]
+    # COMMERCIAL_AUTHORITY approval consumption belongs to
+    # the successful order-completion path inside SalesAgent.
+    # /process-approvals must not mark it processed again.
+    assert processed_ids == []
 
     assert len(logged_events) == 1
 

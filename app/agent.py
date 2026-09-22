@@ -18,6 +18,8 @@ from app.database import (
     get_matching_commercial_approval,
     mark_approval_processed,
     log_sales_event,
+    get_approval_by_id,
+    set_approval_order_id,
 )
 
 # Person 1 sales-triage enhancement (structured enquiry state + triage).
@@ -828,11 +830,11 @@ def execute_tool(tool_name: str, tool_input: dict):
 
         for item in tool_input["items"]:
             authority_result = evaluate_commercial_authority(
-                item["sku"],
-                item["quantity"],
-                tool_input["product_subtotal"],
-                tool_input["discount_percent"]
-            )
+            item["sku"],
+            item["quantity"],
+            tool_input["final_total"],
+            tool_input["discount_percent"]
+        )
 
             if not authority_result.get("success"):
                 return authority_result
@@ -842,7 +844,7 @@ def execute_tool(tool_name: str, tool_input: dict):
                     phone=tool_input["phone"],
                     sku=item["sku"],
                     requested_quantity=item["quantity"],
-                    order_value=tool_input["product_subtotal"],
+                    order_value=tool_input["final_total"],
                     discount_percent=tool_input["discount_percent"],
                 )
 
@@ -874,15 +876,7 @@ def execute_tool(tool_name: str, tool_input: dict):
             delivery_date=tool_input["delivery_date"]
         )
 
-        if order_result.get("success"):
-
-            for approval in matched_approvals:
-
-                mark_approval_processed(
-                    approval["approval_id"]
-                )
-
-        else:
+        if not order_result.get("success"):
 
             # The customer accepted the order, but the system
             # could not persist/create it. Surface this as an
@@ -1943,8 +1937,47 @@ class SalesAgent:
         # relying on the LLM to reconstruct transaction details
         # from conversation history.
         if self.pending_commercial_order is not None:
-
             pending_order = self.pending_commercial_order.copy()
+
+            # -------------------------------------------------
+            # IDEMPOTENCY GUARD
+            #
+            # If this approval has already produced an order,
+            # never create the same approved transaction again.
+            # -------------------------------------------------
+
+            persisted_approval = get_approval_by_id(
+                approval["approval_id"]
+            )
+
+            if (
+                persisted_approval
+                and persisted_approval.get("order_id")
+            ):
+
+                existing_order_id = persisted_approval["order_id"]
+
+                self.pending_commercial_order = None
+
+                confirmation = (
+                    "Your order has already been successfully created. "
+                    f"Order reference: {existing_order_id}."
+                )
+
+                self.messages.append({
+                    "role": "assistant",
+                    "content": confirmation,
+                })
+
+                return {
+                    "success": True,
+                    "response": confirmation,
+                    "order": {
+                        "success": True,
+                        "order_id": existing_order_id,
+                        "already_created": True,
+                    },
+                }
 
             order_result = self._handle_tool(
                 "create_order",
@@ -1967,11 +2000,45 @@ class SalesAgent:
             print("=" * 60)
 
             if order_result.get("success"):
-
-                # Clear only after successful persistence.
-                self.pending_commercial_order = None
-
                 order_id = order_result.get("order_id")
+
+                # Persist which real order consumed this approval.
+                # This lets us identify the order created by this
+                # specific human approval and prevents duplicate
+                # order creation on a retry.
+                link_result = set_approval_order_id(
+                    approval_id=approval["approval_id"],
+                    order_id=order_id,
+                )
+
+                if not link_result.get("success"):
+
+                    self.log_activity(
+                        "approval_order_link_failed",
+                        "Order was created but could not be linked to approval",
+                        {
+                            "approval_id": approval.get("approval_id"),
+                            "order_id": order_id,
+                        },
+                    )
+
+                    return {
+                        "success": False,
+                        "error": "APPROVAL_ORDER_LINK_FAILED",
+                        "message": (
+                            "The order was created, but its approval "
+                            "record could not be finalised."
+                        ),
+                        "order_result": order_result,
+                    }
+
+                mark_approval_processed(
+                    approval["approval_id"]
+                )
+
+                # Only clear the pending transaction after the
+                # persisted order has been linked to its approval.
+                self.pending_commercial_order = None
 
                 self.log_activity(
                     "commercial_order_resumed",

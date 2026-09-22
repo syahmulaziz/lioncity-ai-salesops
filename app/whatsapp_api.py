@@ -729,7 +729,7 @@ async def receive_webhook(
                 str(error),
         }
 
-    # =========================================================
+# =========================================================
 # PROCESS HUMAN APPROVALS
 # =========================================================
 
@@ -878,9 +878,23 @@ def process_approvals():
         # Mark decision as consumed so it isn't sent twice.
         # -------------------------------------------------
 
-        mark_approval_processed(
-            approval_id
-        )
+        # -------------------------------------------------
+        # Mark decision as consumed.
+        #
+        # COMMERCIAL_AUTHORITY approvals are marked
+        # PROCESSED inside agent.py only after the approved
+        # order has actually been persisted successfully.
+        #
+        # Legacy discount approvals do not create an order
+        # at this stage, so this endpoint continues to
+        # consume those after the revised offer is sent.
+        # -------------------------------------------------
+
+        if approval_type != "COMMERCIAL_AUTHORITY":
+
+            mark_approval_processed(
+                approval_id
+            )
 
         processed.append(
             approval_id
