@@ -8,7 +8,10 @@ from app.tools.customer import find_customer
 from app.tools.orders import get_previous_orders
 from app.tools.inventory import check_inventory
 from app.tools.pricing import get_customer_price
-from app.tools.delivery import check_delivery
+from app.tools.delivery import (
+    check_delivery,
+    get_next_available_delivery_slot,
+)
 from app.tools.date_tools import resolve_date
 from app.tools.discount import check_discount_authority
 from app.tools.commercial_policy import evaluate_commercial_authority
@@ -270,8 +273,9 @@ TOOLS = [
         "name": "check_delivery",
         "description": (
             "Check whether LionCity can deliver to a specified area on a "
-            "specified date. You MUST use this before promising a delivery "
-            "date."
+            "specified exact date. Use this for a customer's requested "
+            "delivery date. If the customer asks for the earliest or next "
+            "available date, use get_next_available_delivery_slot instead."
         ),
         "input_schema": {
             "type": "object",
@@ -287,6 +291,32 @@ TOOLS = [
             "required": [
                 "delivery_area",
                 "delivery_date"
+            ]
+        }
+    },
+    {
+        "name": "get_next_available_delivery_slot",
+        "description": (
+            "Find the earliest available delivery slot for a delivery "
+            "area after a specified date. Use this when the customer "
+            "asks for the earliest, next, soonest, or first available "
+            "delivery date, or after a requested delivery date is unavailable. "
+            "Never invent an alternative delivery date."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "delivery_area": {
+                    "type": "string"
+                },
+                "after_date": {
+                    "type": "string",
+                    "description": "Search for availability after this YYYY-MM-DD date."
+                }
+            },
+            "required": [
+                "delivery_area",
+                "after_date"
             ]
         }
     },
@@ -559,6 +589,14 @@ DELIVERY
   resolve_date before checking delivery.
 - Never calculate weekdays or calendar dates yourself.
 - Never invent alternative delivery dates.
+- If the customer asks for the earliest, next, soonest, or first
+  available delivery date, use get_next_available_delivery_slot.
+- If a requested date is unavailable and the customer asks for the
+  next available date, use get_next_available_delivery_slot with the
+  unavailable date as after_date.
+- Offer only the delivery date returned by that tool.
+- If the tool reports no future delivery slot, explain that no suitable
+  future slot was found and offer human assistance.
 - If check_delivery reports that a requested date is unavailable
   or that no delivery slot exists, tell the customer that the
   requested date is unavailable.
@@ -761,6 +799,13 @@ def execute_tool(tool_name: str, tool_input: dict):
         return check_delivery(
             delivery_area=tool_input["delivery_area"],
             delivery_date=tool_input["delivery_date"]
+        )
+
+    if tool_name == "get_next_available_delivery_slot":
+
+        return get_next_available_delivery_slot(
+            delivery_area=tool_input["delivery_area"],
+            after_date=tool_input["after_date"],
         )
 
     if tool_name == "resolve_date":
@@ -994,6 +1039,7 @@ class SalesAgent:
         """
         self._delivery_fee_verified_this_turn = None
         self._delivery_result_this_cycle = None
+        self._next_delivery_result_this_cycle = None
         self._catalogue_result_this_cycle = None
 
         # MULTI-INTENT SAFETY (pre-commit review follow-up).
@@ -1219,14 +1265,41 @@ class SalesAgent:
                 result if isinstance(result, dict) else
                 {"success": False, "can_fulfil": False}
             )
+
             # PERSIST the trusted inventory verification on EnquiryState
-            # (Category B), bound to the checked SKU + requested quantity, so
-            # a later delivery-only turn can still confirm readiness without
-            # re-running check_inventory. A failed lookup clears any prior
-            # verification (never leaves stale sufficiency behind).
+            # (Category B), bound to the checked SKU + requested quantity.
             self.enquiry.set_verified_inventory(result)
-            # Preserve any existing trusted side-effect ingestion.
+
+            # Preserve existing trusted side-effect ingestion.
             self._ingest_tool_side_effects(tool_name, result)
+
+            return result
+
+        if tool_name == "get_next_available_delivery_slot":
+            requested_area = (
+                tool_input.get("delivery_area")
+                if isinstance(tool_input, dict) else None
+            )
+            after_date = (
+                tool_input.get("after_date")
+                if isinstance(tool_input, dict) else None
+            )
+
+            try:
+                result = execute_tool(tool_name, tool_input)
+            except Exception as error:
+                return {
+                    "success": False,
+                    "error": "TOOL_EXECUTION_ERROR",
+                    "message": str(error),
+                }
+
+            # Keep the trusted earliest-slot result for this
+            # response cycle. The finalizer will use this rather
+            # than trusting an LLM-generated delivery date.
+            if isinstance(result, dict):
+                self._next_delivery_result_this_cycle = result
+
             return result
 
         if tool_name == "request_human_handoff":
