@@ -1,6 +1,7 @@
 import json
 import math
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from app.claude_client import get_claude_client
 
@@ -967,7 +968,9 @@ class SalesAgent:
 
         self.client = get_claude_client()
 
-        self.today = date.today().isoformat()
+        self.today = datetime.now(
+            ZoneInfo("Asia/Singapore")
+        ).date().isoformat()
 
         self.system_prompt = (
             SYSTEM_PROMPT
