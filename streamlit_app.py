@@ -576,33 +576,46 @@ with sales_tab:
                     if approval_type == "COMMERCIAL_AUTHORITY":
                         continue
 
-                    requested_col, authority_col = (
-                        st.columns(2)
+                    # -------------------------------------------------
+                    # Dynamic discount approval controls.
+                    # Uses the same commercial policy as the chatbot.
+                    # -------------------------------------------------
+
+                    policies = get_commercial_policies()
+
+                    policy_lookup = {
+                        policy["policy_key"]: policy
+                        for policy in policies
+                    }
+
+                    ai_discount_limit = float(
+                        policy_lookup[
+                            "MAX_DISCOUNT_PERCENT"
+                        ]["policy_value"]
                     )
 
+                    requested_discount = float(
+                        request["requested_percent"]
+                    )
+
+                    requested_col, authority_col = st.columns(2)
 
                     with requested_col:
-
                         st.metric(
                             "Customer Requested",
-                            f"{request['requested_percent']:.0f}%"
+                            f"{requested_discount:g}%"
                         )
-
 
                     with authority_col:
-
                         st.metric(
                             "AI Authority",
-                            "5%"
+                            f"{ai_discount_limit:g}%"
                         )
 
-
                     st.warning(
-                        "The requested discount "
-                        "exceeds the AI Sales Agent's "
-                        "commercial authority."
+                        "The requested discount exceeds the "
+                        "AI Sales Agent's current commercial authority."
                     )
-
 
                     st.write(
                         "**Current Deal:** S$4,735.00"
@@ -616,12 +629,32 @@ with sales_tab:
                         "**Assigned Sales Rep:** Marcus"
                     )
 
-
                     st.divider()
+
+                    approved_discount = st.number_input(
+                        "Approved Discount (%)",
+                        min_value=0.0,
+                        max_value=requested_discount,
+                        value=min(
+                            ai_discount_limit,
+                            requested_discount,
+                        ),
+                        step=0.5,
+                        key=(
+                            f"approved_discount_"
+                            f"{request['approval_id']}"
+                        ),
+                    )
+
+                    st.caption(
+                        f"AI may approve up to {ai_discount_limit:g}% "
+                        f"without human intervention. "
+                        f"The customer requested {requested_discount:g}%."
+                    )
 
 
                     if st.button(
-                        "✓ Approve 7% Discount",
+                        f"✓ Approve {approved_discount:g}% Discount",
                         type="primary",
                         use_container_width=True,
                         key=(
@@ -639,7 +672,7 @@ with sales_tab:
                                 request[
                                     "approval_id"
                                 ],
-                            approved_percent=7,
+                            approved_percent=approved_discount,
                         )
 
 
