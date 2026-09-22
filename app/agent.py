@@ -1063,6 +1063,16 @@ class SalesAgent:
         # inventory check ran this cycle.
         self._inventory_result_this_cycle = None
 
+        # ORDER CONFIRMATION. Trusted result of a SUCCESSFUL create_order
+        # made THIS response cycle. When set, the finalizer renders an
+        # AUTHORITATIVE order-confirmation reply (order reference + status)
+        # from this trusted result, so a stale/incorrect model draft (e.g.
+        # "your order still needs approval") can never reach the customer
+        # after the order has actually been created. None = no order was
+        # successfully created this cycle. Captured BEFORE the post-order
+        # transaction reset so the confirmation details survive that cleanup.
+        self._order_result_this_cycle = None
+
         # DISCOUNT REJECTION (Feature A).
         #
         # Set ONLY by apply_human_rejection() from trusted application state
@@ -1375,9 +1385,19 @@ class SalesAgent:
             tool_name == "create_order"
             and isinstance(result, dict)
             and result.get("success")
-            and not getattr(self, "_suppress_order_completion_reset", False)
         ):
-            self._end_current_transaction()
+            # ORDER CONFIRMATION: retain the trusted success result for THIS
+            # response cycle so the finalizer renders an authoritative
+            # confirmation from it (rather than trusting Claude's draft).
+            # Captured BEFORE _end_current_transaction() clears the enquiry's
+            # transaction state, and independent of the suppression guard used
+            # by the commercial-authority resume path (that path builds its
+            # own confirmation, but capturing here is harmless and keeps the
+            # snapshot consistent).
+            self._order_result_this_cycle = result
+
+            if not getattr(self, "_suppress_order_completion_reset", False):
+                self._end_current_transaction()
 
         return result
 
@@ -1643,6 +1663,69 @@ class SalesAgent:
             "proceed."
         )
 
+    def _render_order_confirmation_section(self):
+        """
+        Deterministically render an AUTHORITATIVE order confirmation from the
+        TRUSTED `_order_result_this_cycle` snapshot (a successful create_order
+        result) only - never from Claude's draft text. Returns "" when no
+        order was successfully created this response cycle.
+
+        This fixes the live bug where, after create_order returned
+        success/CONFIRMED/order_id, the model still emitted a stale
+        "your order needs approval / has been sent for review" reply.
+        Because the trusted tool result is authoritative, the finalizer
+        leads with THIS confirmation and discards the contradicting draft.
+
+        Every rendered value comes from the trusted create_order result;
+        monetary/quantity values are type-guarded and simply omitted (not
+        invented) when absent or malformed.
+        """
+        snapshot = self._order_result_this_cycle
+        if not isinstance(snapshot, dict) or not snapshot.get("success"):
+            return ""
+
+        lines = ["Your order has been confirmed."]
+
+        order_id = snapshot.get("order_id")
+        if order_id:
+            lines.append(f"Order reference: {order_id}")
+
+        # Line items (trusted): SKU x quantity.
+        items = snapshot.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                sku = item.get("sku")
+                qty = item.get("quantity")
+                qty_ok = isinstance(qty, int) and not isinstance(qty, bool)
+                if sku and qty_ok:
+                    lines.append(f"- {sku} x {qty}")
+
+        def _money(value):
+            return (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+            )
+
+        discount = snapshot.get("discount_percent")
+        if _money(discount) and discount > 0:
+            lines.append(f"Discount applied: {discount:g}%")
+
+        final_total = snapshot.get("final_total")
+        if _money(final_total):
+            lines.append(f"Order total: S${final_total:,.2f}")
+
+        area = snapshot.get("delivery_area")
+        date = snapshot.get("delivery_date")
+        if area and date:
+            lines.append(f"Delivery: {area} on {date}")
+        elif area:
+            lines.append(f"Delivery: {area}")
+
+        return "\n".join(lines)
+
     def _inventory_ready(self):
         """
         Trusted stock-readiness check for the delivery proceed-prompt.
@@ -1795,14 +1878,31 @@ class SalesAgent:
         catalogue_section = self._render_catalogue_section()
         delivery_section = self._render_delivery_section()
         rejection_section = self._render_rejection_section()
+        order_confirmation_section = self._render_order_confirmation_section()
 
-        if catalogue_section or delivery_section or rejection_section:
-            # DISCOUNT REJECTION (Feature A) is an AUTHORITATIVE override: the
-            # trusted rejection statement leads, and Claude's own wording is
-            # discarded, so a hostile/incorrect "your discount was approved"
-            # draft can never reach the customer (AC7). It composes safely
-            # with the trusted catalogue/delivery/secondary sections below.
+        if (
+            catalogue_section
+            or delivery_section
+            or rejection_section
+            or order_confirmation_section
+        ):
+            # ORDER CONFIRMATION is an AUTHORITATIVE override: once the
+            # trusted create_order tool returned success/CONFIRMED/order_id,
+            # the confirmation leads and Claude's own wording is discarded,
+            # so a stale/incorrect "your order still needs approval / has been
+            # sent for review" draft can never reach the customer after the
+            # order actually exists.
+            #
+            # DISCOUNT REJECTION (Feature A) is likewise an AUTHORITATIVE
+            # override so a hostile "your discount was approved" draft can
+            # never reach the customer. A successful order and a discount
+            # rejection are mutually exclusive within one response cycle
+            # (a rejection continuation never creates an order), so at most
+            # one of these leads; both compose safely with the trusted
+            # catalogue/delivery/secondary sections below.
             sections = []
+            if order_confirmation_section:
+                sections.append(order_confirmation_section)
             if rejection_section:
                 sections.append(rejection_section)
             sections.extend(
@@ -1839,6 +1939,13 @@ class SalesAgent:
                 sections.append(proceed_prompt)
 
             final_text = "\n\n".join(sections)
+            if order_confirmation_section:
+                self.log_activity(
+                    "order_confirmation_render",
+                    "Rendered authoritative order confirmation from the "
+                    "trusted create_order result instead of the model draft.",
+                    {"draft": draft_text},
+                )
             if rejection_section:
                 self.log_activity(
                     "discount_rejection_render",

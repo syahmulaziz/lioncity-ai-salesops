@@ -26,12 +26,25 @@ PROCEED = "Would you like to proceed with the order?"
 
 
 def _stub_create_order_success(monkeypatch, order_id="SO-TEST-001"):
-    """Stub the module-level execute_tool so create_order succeeds without DB."""
+    """Stub create_order with the real tool's successful-result shape."""
     real_execute = agent_module.execute_tool
 
     def fake_execute_tool(tool_name, tool_input):
         if tool_name == "create_order":
-            return {"success": True, "order_id": order_id}
+            return {
+                "success": True,
+                "order_id": order_id,
+                "customer_id": tool_input["customer_id"],
+                "items": tool_input["items"],
+                "product_subtotal": tool_input["product_subtotal"],
+                "discount_percent": tool_input["discount_percent"],
+                "delivery_fee": tool_input["delivery_fee"],
+                "final_total": tool_input["final_total"],
+                "delivery_area": tool_input["delivery_area"],
+                "delivery_date": tool_input["delivery_date"],
+                "status": "CONFIRMED",
+            }
+
         return real_execute(tool_name, tool_input)
 
     monkeypatch.setattr(agent_module, "execute_tool", fake_execute_tool)
@@ -77,6 +90,39 @@ def test_successful_order_resets_transaction_state(monkeypatch):
 
     agent.send("10 units of Industrial Cable")
     assert agent.enquiry.verified_inventory_can_fulfil is True
+
+def test_successful_order_confirmation_overrides_contradictory_model_draft(
+    monkeypatch
+):
+    """
+    Once create_order succeeds, the trusted CONFIRMED order result must be
+    authoritative. A contradictory Claude draft must never tell the customer
+    that further approval is required.
+    """
+    _stub_create_order_success(
+        monkeypatch,
+        order_id="SO-TEST-CONFIRMED-001"
+    )
+
+    script = [
+        [("create_order", _order_tool_input())],
+        (
+            "I need to get final approval from our sales team "
+            "before I can create this order."
+        ),
+    ]
+
+    agent, tools = build_agent(monkeypatch, script)
+
+    result = agent.send("Yes, proceed with the order")
+
+    response = result["response"]
+
+    assert "SO-TEST-CONFIRMED-001" in response
+    assert "confirmed" in response.lower()
+
+    assert "final approval" not in response.lower()
+    assert "before i can create this order" not in response.lower()
 
     agent.send("Yes, create the order")
     # Completed-transaction readiness is cleared.
