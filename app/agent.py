@@ -959,6 +959,17 @@ class SalesAgent:
         # deterministically after commercial approval.
         self.pending_commercial_order = None
 
+        # DELIVERY READINESS (Feature B): a successful order creation ENDS
+        # the current transaction. Rather than track a separate sticky
+        # "order already created" flag (which, on a reused SalesAgent, would
+        # either suppress every future order's proceed prompt forever or, if
+        # cleared too eagerly, leave stale readiness), we deterministically
+        # clear the completed transaction's order-readiness state via
+        # EnquiryState.reset_after_order_completion(). With product /
+        # quantity / verified inventory cleared, _render_proceed_prompt()
+        # naturally returns "" until the NEXT order re-establishes them with
+        # a fresh check_inventory - so no extra flag is needed.
+
         # RESPONSE-CYCLE GROUNDING STATE (Person 1 grounding fixes).
         #
         # These hold the TRUSTED result of the most recent check_delivery /
@@ -999,6 +1010,21 @@ class SalesAgent:
         self._faq_result_this_cycle = None
         self._specific_product_result_this_cycle = None
         self._handoff_result_this_cycle = None
+
+        # DELIVERY READINESS (Feature B). Trusted result of the most recent
+        # check_inventory call THIS response cycle, so the delivery
+        # proceed-prompt can require verified stock sufficiency. None = no
+        # inventory check ran this cycle.
+        self._inventory_result_this_cycle = None
+
+        # DISCOUNT REJECTION (Feature A).
+        #
+        # Set ONLY by apply_human_rejection() from trusted application state
+        # (the requested discount percent on the pending approval). When set,
+        # the finalizer emits an authoritative, deterministic rejection
+        # message and never lets a model "your discount was approved" claim
+        # reach the customer. None = no rejection was applied this cycle.
+        self._discount_rejection_this_cycle = None
 
     def log_activity(
         self,
@@ -1164,6 +1190,45 @@ class SalesAgent:
             )
             return normalised
 
+        if tool_name == "check_inventory":
+            # DELIVERY READINESS (Feature B reconciliation): the delivery
+            # proceed-prompt must not fire when stock cannot fulfil the
+            # requested quantity. check_inventory is the trusted stock
+            # signal; retain the LATEST result for THIS response cycle so
+            # _render_proceed_prompt() can require verified stock
+            # sufficiency. The tool's behaviour is otherwise unchanged
+            # (its result is still returned to Claude as before).
+            #
+            # A tool-execution failure records an explicit unverified stock
+            # attempt this cycle (can_fulfil False) so the prompt stays
+            # suppressed rather than silently "no inventory check happened".
+            try:
+                result = execute_tool(tool_name, tool_input)
+            except Exception as error:
+                self._inventory_result_this_cycle = {
+                    "success": False,
+                    "can_fulfil": False,
+                }
+                return {
+                    "success": False,
+                    "error": "TOOL_EXECUTION_ERROR",
+                    "message": str(error),
+                }
+
+            self._inventory_result_this_cycle = (
+                result if isinstance(result, dict) else
+                {"success": False, "can_fulfil": False}
+            )
+            # PERSIST the trusted inventory verification on EnquiryState
+            # (Category B), bound to the checked SKU + requested quantity, so
+            # a later delivery-only turn can still confirm readiness without
+            # re-running check_inventory. A failed lookup clears any prior
+            # verification (never leaves stale sufficiency behind).
+            self.enquiry.set_verified_inventory(result)
+            # Preserve any existing trusted side-effect ingestion.
+            self._ingest_tool_side_effects(tool_name, result)
+            return result
+
         if tool_name == "request_human_handoff":
             # Explicit, score-independent handoff. Works regardless of the
             # triage band. Persistence lives in app/handoff.py (sales_events),
@@ -1223,6 +1288,23 @@ class SalesAgent:
 
         # Ingest verified results into Category B via trusted setters only.
         self._ingest_tool_side_effects(tool_name, result)
+
+        # DELIVERY READINESS (Feature B): a SUCCESSFUL order creation ends
+        # the current transaction. Clear the completed transaction's
+        # order-readiness state so a reused SalesAgent cannot let this
+        # order's product/quantity/inventory authorise or block the NEXT
+        # order. Done AFTER ingestion and AFTER the trusted result is
+        # captured for the caller's confirmation - the customer confirmation
+        # is built from `result` (the trusted order result), never from the
+        # now-cleared enquiry fields. Only a genuine success triggers this;
+        # a failed create_order leaves all transaction state intact for retry.
+        if (
+            tool_name == "create_order"
+            and isinstance(result, dict)
+            and result.get("success")
+            and not getattr(self, "_suppress_order_completion_reset", False)
+        ):
+            self._end_current_transaction()
 
         return result
 
@@ -1451,6 +1533,153 @@ class SalesAgent:
             "- please try again or contact us directly."
         )
 
+    def _render_rejection_section(self):
+        """
+        Deterministically render the discount-rejection portion of the final
+        response from the TRUSTED `_discount_rejection_this_cycle` snapshot
+        only - never from Claude's draft text. Returns "" when no rejection
+        was applied this response cycle.
+
+        This is the AUTHORITATIVE customer-facing statement of a REJECTED
+        human decision (Feature A, AC6/AC7). It:
+          - clearly states the requested discount was NOT approved;
+          - never claims the discount was approved;
+          - never claims an order was placed, reserved, cancelled, or that
+            the customer accepted base pricing;
+          - invites the customer to decide whether to proceed at standard/
+            available pricing (agency preserved), without creating anything.
+        The requested percent comes from trusted application state.
+        """
+        snapshot = self._discount_rejection_this_cycle
+        if not isinstance(snapshot, dict):
+            return ""
+        requested = snapshot.get("requested_percent")
+        req_is_number = isinstance(requested, (int, float)) and not isinstance(
+            requested, bool
+        )
+        if req_is_number and math.isfinite(requested):
+            lead = (
+                f"Your requested {requested:g}% discount could not be "
+                f"approved."
+            )
+        else:
+            lead = "Your requested discount could not be approved."
+        return (
+            f"{lead} You can still continue at our standard/available "
+            "pricing if you'd like - just let me know how you'd like to "
+            "proceed."
+        )
+
+    def _inventory_ready(self):
+        """
+        Trusted stock-readiness check for the delivery proceed-prompt.
+
+        Uses the PERSISTED verified-inventory snapshot on EnquiryState, bound
+        to the SKU + requested quantity it was checked for, so a legitimate
+        verification survives across turns (fixing the multi-turn Jira
+        scenario where inventory is verified in turn 1 and only delivery is
+        asked in turn 2). Returns True ONLY when that persisted verification
+        EXACTLY matches the CURRENT product_sku + quantity AND can_fulfil is
+        True.
+
+        Any mismatch returns False: no verification, a verification for a
+        different SKU or a different quantity (stale after a product/quantity
+        change), out-of-stock, or insufficient stock. Reads ONLY trusted
+        stored values - never Claude's prose, never the delivery result,
+        never a subtotal.
+        """
+        current_sku = getattr(self.enquiry, "product_sku", None)
+        current_quantity = getattr(self.enquiry, "quantity", None)
+        return self.enquiry.inventory_ready_for(current_sku, current_quantity)
+
+    def _order_prerequisites_met(self):
+        """
+        Trusted, conservative check that the enquiry has the minimum
+        structured facts needed before it is meaningful to ask the customer
+        whether to proceed with an order: a verified product and a validated
+        quantity on EnquiryState. Reads ONLY trusted state (never Claude's
+        prose). Used by the delivery proceed-prompt (Feature B).
+        """
+        product_sku = getattr(self.enquiry, "product_sku", None)
+        quantity = getattr(self.enquiry, "quantity", None)
+        has_product = bool(product_sku)
+        has_quantity = (
+            isinstance(quantity, int)
+            and not isinstance(quantity, bool)
+            and quantity > 0
+        )
+        return has_product and has_quantity
+
+    def _end_current_transaction(self):
+        """
+        End the current transaction after a SUCCESSFUL order completion by
+        clearing the completed order's readiness state on EnquiryState.
+
+        Defensive: some approval-flow unit tests construct a SalesAgent via
+        object.__new__ (bypassing __init__) and do not attach an EnquiryState.
+        In real runtime self.enquiry is always present (set in __init__); the
+        guard simply makes this a safe no-op when it is absent.
+        """
+        enquiry = getattr(self, "enquiry", None)
+        if enquiry is not None and hasattr(
+            enquiry, "reset_after_order_completion"
+        ):
+            enquiry.reset_after_order_completion()
+
+    def _render_proceed_prompt(self):
+        """
+        Feature B: return a clear "would you like to proceed?" question, or
+        "" when it is NOT semantically safe to ask.
+
+        Decided ENTIRELY from trusted state (the current-cycle delivery
+        snapshot + persisted EnquiryState inventory verification +
+        pending-approval / order-created state) - never by parsing Claude's
+        prose. The prompt is emitted ONLY when ALL hold:
+          - NO human/commercial decision is pending (an unresolved discount
+            approval OR a pending commercial-authority order means the
+            customer cannot yet simply confirm), and
+          - the current transaction's order has NOT already been created, and
+          - a delivery check ran this cycle and returned an AVAILABLE slot
+            (unavailable / tool-failure / malformed snapshots return ""), and
+          - order prerequisites are satisfied (verified product + quantity), and
+          - PERSISTED verified stock EXACTLY matches the current SKU +
+            quantity and can_fulfil is True (out-of-stock / insufficient /
+            stale-SKU / stale-quantity / never-verified => "").
+        Asking the question NEVER creates, reserves, or confirms an order;
+        the customer must still send an affirmative message that re-enters
+        the normal order flow.
+        """
+        # Blocked while a human decision is still outstanding.
+        if getattr(self, "pending_approval", None) is not None:
+            return ""
+        if getattr(self, "pending_commercial_order", None) is not None:
+            return ""
+
+        # NOTE: an already-completed order no longer needs a separate flag
+        # here. reset_after_order_completion() clears the completed
+        # transaction's product / quantity / verified inventory, so the
+        # prerequisite and inventory-readiness checks below already return
+        # False until a NEW order re-establishes them with a fresh
+        # check_inventory.
+
+        snapshot = self._delivery_result_this_cycle
+        if not isinstance(snapshot, dict) or not snapshot.get("success"):
+            return ""
+        if snapshot.get("available") is not True:
+            return ""
+
+        if not self._order_prerequisites_met():
+            return ""
+
+        # Verified stock sufficiency is REQUIRED before inviting the customer
+        # to proceed. Uses the PERSISTED verification matched to the CURRENT
+        # SKU + quantity, so it survives a later delivery-only turn but never
+        # authorises a stale SKU/quantity, out-of-stock, or insufficient stock.
+        if not self._inventory_ready():
+            return ""
+
+        return "Would you like to proceed with the order?"
+
     def _finalize_customer_response(self, response_content):
         """
         SINGLE shared customer-response finalizer.
@@ -1492,9 +1721,20 @@ class SalesAgent:
 
         catalogue_section = self._render_catalogue_section()
         delivery_section = self._render_delivery_section()
+        rejection_section = self._render_rejection_section()
 
-        if catalogue_section or delivery_section:
-            sections = [s for s in (catalogue_section, delivery_section) if s]
+        if catalogue_section or delivery_section or rejection_section:
+            # DISCOUNT REJECTION (Feature A) is an AUTHORITATIVE override: the
+            # trusted rejection statement leads, and Claude's own wording is
+            # discarded, so a hostile/incorrect "your discount was approved"
+            # draft can never reach the customer (AC7). It composes safely
+            # with the trusted catalogue/delivery/secondary sections below.
+            sections = []
+            if rejection_section:
+                sections.append(rejection_section)
+            sections.extend(
+                s for s in (catalogue_section, delivery_section) if s
+            )
 
             # Restore any OTHER trusted secondary-intent section that also
             # applies this cycle (see MULTI-INTENT SAFETY above). Order
@@ -1512,7 +1752,27 @@ class SalesAgent:
             ]
             sections.extend(secondary_sections)
 
+            # FEATURE B: append the proceed-to-order prompt LAST, and only
+            # when trusted state proves it is safe to ask (available delivery
+            # this cycle + product/quantity known + verified stock
+            # sufficiency + no pending approval). _render_proceed_prompt()
+            # gates on all of these, so it is safe to call here even when a
+            # rejection is the authoritative message (AC-B6): after a
+            # rejection the customer keeps agency and the prompt appears only
+            # if the order is genuinely ready to proceed at the available/
+            # base price. Rendering-only: it never creates an order.
+            proceed_prompt = self._render_proceed_prompt()
+            if proceed_prompt:
+                sections.append(proceed_prompt)
+
             final_text = "\n\n".join(sections)
+            if rejection_section:
+                self.log_activity(
+                    "discount_rejection_render",
+                    "Rendered authoritative discount-rejection reply from "
+                    "trusted state instead of the model draft.",
+                    {"draft": draft_text},
+                )
             if catalogue_section:
                 self.log_activity(
                     "catalogue_grounding_render",
@@ -1532,6 +1792,13 @@ class SalesAgent:
                     "Restored trusted secondary-intent section(s) alongside "
                     "the catalogue/delivery grounding.",
                     {"draft": draft_text, "sections": secondary_sections},
+                )
+            if proceed_prompt:
+                self.log_activity(
+                    "delivery_proceed_prompt",
+                    "Appended proceed-to-order prompt from trusted delivery "
+                    "and inventory state (no order created).",
+                    {"draft": draft_text},
                 )
         else:
             final_text = draft_text
@@ -1958,6 +2225,10 @@ class SalesAgent:
                 existing_order_id = persisted_approval["order_id"]
 
                 self.pending_commercial_order = None
+                # An order already exists for this transaction (idempotent
+                # retry). End the transaction so a later delivery lookup does
+                # not offer to proceed again with the just-completed order.
+                self._end_current_transaction()
 
                 confirmation = (
                     "Your order has already been successfully created. "
@@ -1979,10 +2250,19 @@ class SalesAgent:
                     },
                 }
 
-            order_result = self._handle_tool(
-                "create_order",
-                pending_order,
-            )
+            # DELIVERY READINESS (Feature B) + SCRUM-19 ordering: defer the
+            # post-order transaction cleanup until AFTER the approval order_id
+            # is linked and the approval is marked processed. So suppress the
+            # inner _handle_tool auto-reset here and perform the reset
+            # explicitly on the confirmed-success path below.
+            self._suppress_order_completion_reset = True
+            try:
+                order_result = self._handle_tool(
+                    "create_order",
+                    pending_order,
+                )
+            finally:
+                self._suppress_order_completion_reset = False
 
             # TEMPORARY DEBUGGING:
             # Show exactly what was retried after human approval
@@ -2039,6 +2319,13 @@ class SalesAgent:
                 # Only clear the pending transaction after the
                 # persisted order has been linked to its approval.
                 self.pending_commercial_order = None
+
+                # DELIVERY READINESS (Feature B): the order is now fully
+                # completed (created + linked + processed), so end the
+                # current transaction. Performed HERE - only after both
+                # set_approval_order_id and mark_approval_processed have
+                # succeeded - never on the link/processing failure paths.
+                self._end_current_transaction()
 
                 self.log_activity(
                     "commercial_order_resumed",
@@ -2179,6 +2466,101 @@ class SalesAgent:
         # so a delivery/catalogue result from the PRECEDING customer turn
         # can never leak into this continuation's response.
         self._reset_response_grounding()
+
+        return self._continue_after_human_action()
+
+    def apply_human_rejection(
+        self,
+        requested_discount_percent: float = None
+    ):
+        """
+        Inject a TRUSTED human REJECTION of a requested discount into the
+        existing conversation and let Claude resume (Feature A).
+
+        REJECT DISCOUNT != REJECT ORDER. This method:
+          - requires an in-memory PENDING discount approval (same guard as
+            apply_human_approval), returning NO_PENDING_APPROVAL otherwise;
+          - takes the requested percent from TRUSTED application state (the
+            pending_approval record), ignoring the caller-supplied value when
+            the stored value is available, so the rejection is always bound
+            to the discount the customer actually requested;
+          - injects trusted context stating the discount was NOT approved,
+            that only the discount was rejected (no order cancelled, none
+            created), and that the customer may still proceed at permitted/
+            base pricing;
+          - sets a deterministic per-cycle rejection flag so the shared
+            finalizer emits the authoritative rejection message and can never
+            let a model "approved" claim reach the customer;
+          - never calls create_order and never cancels an order.
+
+        It uses the SAME discount continuation path as apply_human_approval
+        (_continue_after_human_action + _finalize_customer_response). It does
+        NOT touch pending_commercial_order and never enters the commercial-
+        authority order-completion flow (SCRUM-19 / e213572), so a discount
+        rejection can never create or link an order.
+        """
+        if self.pending_approval is None:
+
+            return {
+                "success": False,
+                "error": "NO_PENDING_APPROVAL"
+            }
+
+        # Trust the STORED requested discount over any caller-supplied value.
+        stored_requested = self.pending_approval.get(
+            "requested_discount_percent"
+        )
+        if stored_requested is not None:
+            requested_discount = stored_requested
+        else:
+            requested_discount = requested_discount_percent
+
+        self.pending_approval["status"] = "REJECTED"
+
+        self.log_activity(
+            "human_rejection",
+            (
+                f"Human rejected "
+                f"{requested_discount}% discount request"
+            ),
+            self.pending_approval.copy()
+        )
+
+        # ---------------------------------------------
+        # Inject TRUSTED HUMAN context (rejection).
+        # ---------------------------------------------
+
+        self.messages.append({
+            "role": "user",
+            "content": (
+                "[TRUSTED HUMAN SALES DECISION - DISCOUNT REJECTED]\n"
+                f"A sales representative reviewed the customer's "
+                f"{requested_discount}% discount request and did NOT "
+                f"approve it.\n\n"
+                "This rejects ONLY the requested discount. It does NOT "
+                "cancel any order, does NOT create or reserve any order, "
+                "does NOT end the conversation, and does NOT mean the "
+                "customer declined to purchase.\n\n"
+                "Inform the customer that their requested discount could "
+                "not be approved. They may still choose to proceed at the "
+                "standard/available price, or decide not to. "
+                "Do NOT claim that any discount was approved. "
+                "Do NOT claim that an order has been placed, reserved, or "
+                "cancelled."
+            )
+        })
+
+        # Rejection has now been consumed.
+        self.pending_approval = None
+
+        # Reset response-cycle grounding ONCE before starting this fresh
+        # rejection-continuation cycle, then set the trusted per-cycle
+        # rejection flag AFTER the reset (the reset clears it), so the
+        # finalizer renders the authoritative rejection message.
+        self._reset_response_grounding()
+        self._discount_rejection_this_cycle = {
+            "requested_percent": requested_discount,
+        }
 
         return self._continue_after_human_action()
 

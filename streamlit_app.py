@@ -6,6 +6,7 @@ import streamlit as st
 from app.database import (
     get_pending_approvals,
     approve_request,
+    reject_request,
     get_table_data,
     update_inventory,
     update_delivery_capacity,
@@ -245,6 +246,15 @@ with sales_tab:
         )
 
 
+    elif status == "AWAITING_CUSTOMER_REJECTED":
+
+        st.warning(
+            "🟡 AWAITING CUSTOMER — requested "
+            "discount rejected; customer may proceed "
+            "at standard pricing"
+        )
+
+
     elif status == "ORDER_CONFIRMED":
 
         st.success(
@@ -343,6 +353,45 @@ with sales_tab:
                     st.info(
                         "Revised offer has been sent "
                         "to the customer on WhatsApp."
+                    )
+
+
+            elif status == "AWAITING_CUSTOMER_REJECTED":
+
+                # A REJECTED discount decision must NEVER be shown as an
+                # approval (no "Approved", no "0%"). It is an explicit
+                # rejection, distinguished from the persisted decision state
+                # (DISCOUNT + approved_percent IS NULL + order_id IS NULL),
+                # never inferred from a numeric zero.
+                with st.container(
+                    border=True
+                ):
+
+                    st.warning(
+                        "✗ DISCOUNT REJECTED"
+                    )
+
+                    requested = sales_state.get(
+                        "requested_percent"
+                    )
+
+                    if requested is not None:
+
+                        st.write(
+                            "**Requested Discount:** "
+                            f"{requested:.0f}%"
+                        )
+
+                    st.write(
+                        "**Decision:** Discount Rejected"
+                    )
+
+                    st.info(
+                        "The customer has been told on "
+                        "WhatsApp that the requested "
+                        "discount was not approved. They "
+                        "may still proceed at standard "
+                        "pricing."
                     )
 
 
@@ -653,7 +702,12 @@ with sales_tab:
                     )
 
 
-                    if st.button(
+                    # Approve and Reject act on the SAME trusted approval_id
+                    # shown in this Human Decision card. REJECT DISCOUNT is a
+                    # distinct decision - it is NOT an approval of 0%.
+                    approve_col, reject_col = st.columns(2)
+
+                    approve_clicked = approve_col.button(
                         f"✓ Approve {approved_discount:g}% Discount",
                         type="primary",
                         use_container_width=True,
@@ -661,7 +715,18 @@ with sales_tab:
                             f"approve_"
                             f"{request['approval_id']}"
                         ),
-                    ):
+                    )
+
+                    reject_clicked = reject_col.button(
+                        "✗ Reject Discount",
+                        use_container_width=True,
+                        key=(
+                            f"reject_"
+                            f"{request['approval_id']}"
+                        ),
+                    )
+
+                    if approve_clicked:
 
                         # ---------------------------------
                         # Record human decision in SQLite.
@@ -799,6 +864,137 @@ with sales_tab:
                                     str(error)
                                 )
 
+
+                            st.rerun()
+
+                    if reject_clicked:
+
+                        # ---------------------------------
+                        # Record REJECTION in SQLite. This
+                        # is a distinct decision, guarded to
+                        # only fire on a PENDING row (safe on
+                        # double-click / already-decided).
+                        # ---------------------------------
+
+                        result = reject_request(
+                            approval_id=request[
+                                "approval_id"
+                            ],
+                        )
+
+                        if not result["success"]:
+
+                            st.error(
+                                "Rejection could not "
+                                "be recorded (the request "
+                                "may already have been "
+                                "decided)."
+                            )
+
+                        else:
+
+                            # -----------------------------
+                            # Ask FastAPI to resume the
+                            # SAME WhatsApp SalesAgent with
+                            # the trusted rejection.
+                            # -----------------------------
+
+                            try:
+
+                                with st.spinner(
+                                    "Applying rejection "
+                                    "and updating customer "
+                                    "on WhatsApp..."
+                                ):
+
+                                    api_response = (
+                                        requests.post(
+                                            "http://localhost:8000/"
+                                            "process-approvals",
+                                            timeout=90,
+                                        )
+                                    )
+
+                                api_response.raise_for_status()
+
+                                api_result = (
+                                    api_response.json()
+                                )
+
+                                approval_id = (
+                                    request[
+                                        "approval_id"
+                                    ]
+                                )
+
+                                if (
+                                    approval_id
+                                    in api_result.get(
+                                        "processed",
+                                        []
+                                    )
+                                ):
+
+                                    st.success(
+                                        "✓ Discount rejected "
+                                        "and the customer has "
+                                        "been notified."
+                                    )
+
+                                else:
+
+                                    st.error(
+                                        "Rejection was "
+                                        "recorded, but "
+                                        "FastAPI did not "
+                                        "apply it."
+                                    )
+
+                                    skipped = (
+                                        api_result.get(
+                                            "skipped",
+                                            []
+                                        )
+                                    )
+
+                                    if skipped:
+
+                                        st.json(
+                                            skipped
+                                        )
+
+                            except (
+                                requests.exceptions
+                                .ConnectionError
+                            ):
+
+                                st.error(
+                                    "Rejection was saved, "
+                                    "but FastAPI could not "
+                                    "be reached."
+                                )
+
+                            except (
+                                requests.exceptions
+                                .Timeout
+                            ):
+
+                                st.error(
+                                    "Rejection was saved, "
+                                    "but FastAPI timed out."
+                                )
+
+                            except Exception as error:
+
+                                st.error(
+                                    "Rejection was saved, "
+                                    "but an error occurred "
+                                    "while updating WhatsApp."
+                                )
+
+                                st.code(
+                                    str(error)
+                                )
 
                             st.rerun()
 

@@ -10,6 +10,7 @@ from app.agent import SalesAgent
 from app.database import (
     create_approval_request,
     get_approved_unprocessed_requests,
+    get_rejected_unprocessed_requests,
     mark_approval_processed,
     reset_demo_data,
     is_message_processed,
@@ -902,6 +903,153 @@ def process_approvals():
 
         print(
             "Approval applied successfully."
+        )
+
+    # =====================================================
+    # DISCOUNT REJECTIONS (Feature A) - ADDITIVE.
+    #
+    # Existing APPROVED handling above is UNCHANGED, including the
+    # SCRUM-19 (e213572) rule that COMMERCIAL_AUTHORITY approvals are
+    # consumed by the agent's order-completion path, not here. Rejections
+    # are a separate, explicit human decision: resume the SAME in-memory
+    # SalesAgent with a TRUSTED rejection, tell the customer their
+    # requested discount was not approved, log the rejection, and mark the
+    # decision processed so it is never resumed twice.
+    #
+    # A discount rejection NEVER creates or links an order, so (unlike a
+    # commercial-authority approval) it is correctly consumed HERE after
+    # the customer has been notified.
+    #
+    # IDEMPOTENCY: a rejected row leaves get_rejected_unprocessed_requests()
+    # the moment mark_approval_processed() advances it to PROCESSED, exactly
+    # like the approval path. A second /process-approvals call therefore
+    # sends no duplicate rejection message.
+    #
+    # KNOWN PARTIAL-FAILURE LIMITATION (pre-existing, shared with the
+    # approval path, intentionally not redesigned here): the WhatsApp send
+    # happens BEFORE mark_approval_processed(). A crash between those two
+    # steps means a retry would re-send the rejection (at-least-once
+    # delivery). Building a full outbox/transaction is out of scope.
+    # =====================================================
+
+    rejections = (
+        get_rejected_unprocessed_requests()
+    )
+
+    print("\n" + "=" * 60)
+    print("PROCESSING HUMAN REJECTIONS")
+    print("=" * 60)
+
+    for rejection in rejections:
+
+        approval_id = rejection[
+            "approval_id"
+        ]
+
+        # Customer/session identity comes from the TRUSTED stored record,
+        # never from any client-supplied value (cross-customer safety).
+        phone = rejection[
+            "phone"
+        ]
+
+        requested_percent = rejection.get(
+            "requested_percent"
+        )
+
+        print(
+            "\nRejection:",
+            approval_id
+        )
+
+        print(
+            "Customer:",
+            phone
+        )
+
+        print(
+            "Requested percent:",
+            requested_percent
+        )
+
+        agent = customer_agents.get(
+            phone
+        )
+
+        if agent is None:
+
+            print(
+                "No active SalesAgent found "
+                "for customer."
+            )
+
+            skipped.append({
+                "approval_id": approval_id,
+                "reason": "NO_ACTIVE_AGENT",
+            })
+
+            continue
+
+        result = agent.apply_human_rejection(
+            requested_discount_percent=requested_percent
+        )
+
+        if not result.get("success"):
+
+            print(
+                "Agent could not apply rejection:",
+                result
+            )
+
+            skipped.append({
+                "approval_id": approval_id,
+                "reason": "AGENT_REJECTED_REJECTION",
+                "agent_result": result,
+            })
+
+            continue
+
+        # -------------------------------------------------
+        # Send rejection outcome to REAL WhatsApp.
+        # -------------------------------------------------
+
+        send_whatsapp_message(
+            recipient=phone,
+            message=result["response"],
+        )
+
+        # -------------------------------------------------
+        # SALESOPS — HUMAN DECISION (REJECTION)
+        # -------------------------------------------------
+
+        log_sales_event(
+            event_type="HUMAN_APPROVAL_REJECTED",
+            phone=phone,
+            details=(
+                f"Rejected discount: "
+                f"{requested_percent}%"
+            ),
+        )
+
+        print(
+            "SALES EVENT LOGGED: "
+            "HUMAN_APPROVAL_REJECTED"
+        )
+
+        # -------------------------------------------------
+        # Mark decision as consumed so it isn't sent twice.
+        # A rejection creates no order, so it is consumed here.
+        # -------------------------------------------------
+
+        mark_approval_processed(
+            approval_id
+        )
+
+        processed.append(
+            approval_id
+        )
+
+        print(
+            "Rejection applied successfully."
         )
 
     return {
