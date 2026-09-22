@@ -1064,6 +1064,80 @@ def get_approved_unprocessed_requests():
 
     return [dict(row) for row in rows]
 
+
+# =========================================================
+# DISCOUNT REJECTION (Feature A)
+# =========================================================
+#
+# REJECT DISCOUNT is a SEPARATE, explicit human decision - it is NOT an
+# approval of 0%. The status column is unconstrained TEXT, so the literal
+# 'REJECTED' is storable with no schema migration.
+#
+# reject_request() mirrors approve_request(): a single atomic guarded
+# UPDATE that only fires on a currently-PENDING row. This makes every
+# unsafe transition fail safely with success=False (rowcount 0):
+#   PENDING   -> REJECTED : allowed (rowcount 1)
+#   REJECTED  -> REJECTED : refused (already resolved, not PENDING)
+#   APPROVED  -> REJECTED : refused (completed decision preserved)
+#   PROCESSED -> REJECTED : refused (completed decision preserved)
+#   unknown id           : refused (no matching PENDING row)
+# It never sets approved_percent (a rejection has no approved value) and
+# never sets order_id (a rejection never creates an order), so a rejected
+# row can never be mistaken for an approved 0% decision or a fulfilled
+# commercial-authority order.
+def reject_request(
+    approval_id: int
+):
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        UPDATE approval_requests
+        SET status = 'REJECTED'
+        WHERE approval_id = ?
+          AND status = 'PENDING'
+    """, (
+        approval_id,
+    ))
+
+    connection.commit()
+
+    changed = cursor.rowcount
+
+    connection.close()
+
+    return {
+        "success": changed == 1,
+        "approval_id": approval_id,
+        "status": "REJECTED" if changed == 1 else None,
+    }
+
+
+def get_rejected_unprocessed_requests():
+    """
+    Return REJECTED-but-not-yet-processed decisions, oldest first, exactly
+    mirroring get_approved_unprocessed_requests(). /process-approvals uses
+    this to resume the customer's conversation with a trusted rejection.
+    A row leaves this set once mark_approval_processed() advances it to
+    PROCESSED, giving the same at-least-once idempotency as the approval
+    path (no new machinery).
+    """
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM approval_requests
+        WHERE status = 'REJECTED'
+        ORDER BY approval_id ASC
+    """)
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
+
 # HAFIZAH: FIND MATCHING COMMERCIAL AUTHORITY APPROVAL
 def get_matching_commercial_approval(
     phone: str,
@@ -1548,11 +1622,43 @@ def get_latest_sales_state():
         and approval["status"] == "PROCESSED"
     ):
 
+        # A PROCESSED row is a completed human decision. Distinguish a
+        # REJECTED-then-processed DISCOUNT from an APPROVED-then-processed
+        # decision WITHOUT inferring rejection from a numeric zero:
+        # reject_request never writes approved_percent, while approve_request
+        # always writes a real value.
+        #
+        # RECONCILIATION (e213572 / SCRUM-19): a COMMERCIAL_AUTHORITY
+        # approval can also reach PROCESSED, and the order-completion flow
+        # persists an order_id on it. To guarantee a commercial-authority
+        # decision is NEVER shown as "Discount Rejected", require BOTH:
+        #   approval_type == 'DISCOUNT'  (only discount decisions can be a
+        #                                 discount rejection), AND
+        #   approved_percent IS NULL     (a discount rejection has no
+        #                                 approved value), AND
+        #   order_id IS NULL             (a rejection never created an order).
+        if (
+            approval.get("approval_type") == "DISCOUNT"
+            and approval["approved_percent"] is None
+            and approval.get("order_id") is None
+        ):
+
+            return {
+                "status": "AWAITING_CUSTOMER_REJECTED",
+                "status_label": "Awaiting Customer Decision",
+                "quote_amount": None,
+                "discount_percent": None,
+                "decision": "REJECTED",
+                "requested_percent": approval["requested_percent"],
+                "order_id": None,
+            }
+
         return {
             "status": "AWAITING_CUSTOMER",
             "status_label": "Awaiting Customer Decision",
             "quote_amount": None,
             "discount_percent": approval["approved_percent"],
+            "decision": "APPROVED",
             "order_id": None,
         }
 

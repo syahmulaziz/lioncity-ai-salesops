@@ -121,6 +121,15 @@ class EnquiryState:
     verified_unit_price: float = None    # trusted unit price from pricing tool ONLY
     verified_subtotal: float = None      # from a successful pricing tool ONLY
 
+    # Verified inventory (Category B), from a successful check_inventory tool
+    # result ONLY. Bound to the SKU + requested quantity it was verified for,
+    # so readiness checks can confirm the verification still matches the
+    # CURRENT product/quantity (and is invalidated when either changes).
+    verified_inventory_sku: str = None            # SKU the stock was checked for
+    verified_inventory_quantity: int = None       # requested quantity checked
+    verified_inventory_available: int = None      # available_quantity returned
+    verified_inventory_can_fulfil: bool = None    # trusted can_fulfil result
+
     # ------------------------------------------------------------------
     # CATEGORY C - derived application result (set by triage.py ONLY)
     # ------------------------------------------------------------------
@@ -222,6 +231,10 @@ class EnquiryState:
                 # product keeps them.)
                 self.verified_subtotal = None
                 self.verified_unit_price = None
+                # Inventory verified for the OLD product must not authorise a
+                # DIFFERENT product; clear it whenever the verified product is
+                # cleared. Re-running check_inventory repopulates it.
+                self._clear_verified_inventory()
 
         elif field_name == "quantity":
             # A change in quantity invalidates the subtotal verified for the
@@ -230,6 +243,18 @@ class EnquiryState:
             # price with it; re-pricing repopulates both for the new quantity.
             self.verified_subtotal = None
             self.verified_unit_price = None
+            # Inventory sufficiency was verified for the OLD requested
+            # quantity; a new quantity may exceed available stock, so the old
+            # verification must not authorise it. Re-running check_inventory
+            # repopulates it for the new quantity.
+            self._clear_verified_inventory()
+
+    def _clear_verified_inventory(self):
+        """Reset all verified-inventory (Category B) fields to unknown."""
+        self.verified_inventory_sku = None
+        self.verified_inventory_quantity = None
+        self.verified_inventory_available = None
+        self.verified_inventory_can_fulfil = None
 
     def _validate_field(self, field_name, value):
         """
@@ -348,6 +373,108 @@ class EnquiryState:
         unit_price = tool_result.get("unit_price")
         if isinstance(unit_price, (int, float)) and not isinstance(unit_price, bool):
             self.verified_unit_price = float(unit_price)
+
+    def set_verified_inventory(self, tool_result):
+        """
+        Populate the verified inventory snapshot from a successful
+        check_inventory result, binding it to the SKU + requested quantity it
+        was actually checked for.
+
+        This is the ONLY way the verified_inventory_* fields become non-None.
+        A stock level merely claimed by the customer/LLM must never reach this
+        path. An unsuccessful result (e.g. PRODUCT_NOT_FOUND) CLEARS any prior
+        verification, so a failed lookup never leaves stale sufficiency behind.
+
+        The stored values are later matched against the CURRENT product_sku +
+        quantity by the readiness check, so a verification for a different
+        SKU/quantity can never authorise the current transaction.
+        """
+        if not isinstance(tool_result, dict) or not tool_result.get("success"):
+            self._clear_verified_inventory()
+            return
+
+        sku = tool_result.get("sku")
+        requested_quantity = tool_result.get("requested_quantity")
+        available_quantity = tool_result.get("available_quantity")
+        can_fulfil = tool_result.get("can_fulfil")
+
+        # Store only well-typed trusted values; otherwise clear (never guess).
+        if not isinstance(sku, str) or sku.strip() == "":
+            self._clear_verified_inventory()
+            return
+        if isinstance(requested_quantity, bool) or not isinstance(
+            requested_quantity, int
+        ):
+            self._clear_verified_inventory()
+            return
+
+        self.verified_inventory_sku = sku
+        self.verified_inventory_quantity = requested_quantity
+        self.verified_inventory_available = (
+            available_quantity
+            if isinstance(available_quantity, int)
+            and not isinstance(available_quantity, bool)
+            else None
+        )
+        self.verified_inventory_can_fulfil = can_fulfil is True
+
+    def reset_after_order_completion(self):
+        """
+        End the CURRENT transaction after an order has been SUCCESSFULLY
+        created, so a reused EnquiryState (one per SalesAgent, shared across
+        every message from the customer) cannot let the just-completed
+        order's state authorise or block the NEXT order.
+
+        Clears ONLY transaction-specific, order-readiness facts:
+          - verified product identity (product_sku / product_name);
+          - the Category A product_query + quantity that defined the order;
+          - verified pricing (verified_subtotal / verified_unit_price);
+          - verified inventory (all verified_inventory_* fields).
+
+        A genuinely new order must therefore re-establish product, quantity
+        and a FRESH check_inventory before it is considered order-ready -
+        even when it happens to request the same SKU and quantity.
+
+        Deliberately PRESERVES long-lived, non-transaction customer context
+        (existing_customer, customer_id, customer_tier, company_name,
+        business_customer, and the derived triage result). This is a targeted
+        cleanup, NOT a full conversation/enquiry reset and NOT a transaction
+        state machine.
+
+        Must be called ONLY after a trusted successful order creation, never
+        on a failed/blocked order and never on a discount rejection.
+        """
+        # Category A order inputs.
+        self.product_query = None
+        self.quantity = None
+        # Category B verified product + pricing for the completed order.
+        self.product_sku = None
+        self.product_name = None
+        self.verified_subtotal = None
+        self.verified_unit_price = None
+        # Category B verified inventory for the completed order.
+        self._clear_verified_inventory()
+
+    def inventory_ready_for(self, sku, quantity):
+        """
+        Return True ONLY when the persisted verified inventory EXACTLY matches
+        the given CURRENT sku + quantity AND can_fulfil is True. Any mismatch
+        (different SKU, different quantity, missing verification, or
+        insufficient stock) returns False. Reads only trusted stored values.
+        """
+        if self.verified_inventory_sku is None:
+            return False
+        if self.verified_inventory_can_fulfil is not True:
+            return False
+        if not sku or self.verified_inventory_sku != sku:
+            return False
+        if (
+            not isinstance(quantity, int)
+            or isinstance(quantity, bool)
+            or self.verified_inventory_quantity != quantity
+        ):
+            return False
+        return True
 
     # ==================================================================
     # CATEGORY C RESULT STORAGE  (set by triage only)
