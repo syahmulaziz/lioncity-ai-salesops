@@ -62,7 +62,28 @@ def create_order(
                 item["unit_price"],
             ))
 
-        # The order and all line items must succeed together.
+        # Deduct inventory for every successfully ordered item.
+        # This is part of the SAME transaction as the order,
+        # so any failure rolls back the entire order.
+        for item in items:
+            cursor.execute("""
+                UPDATE inventory
+                SET available_quantity = available_quantity - ?
+                WHERE sku = ?
+                  AND available_quantity >= ?
+            """, (
+                item["quantity"],
+                item["sku"],
+                item["quantity"],
+            ))
+
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"Insufficient inventory for SKU {item['sku']}"
+                )
+
+        # Order, line items and inventory deduction
+        # must all succeed together.
         connection.commit()
 
     except Exception as error:
