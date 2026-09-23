@@ -1637,7 +1637,9 @@ def get_latest_sales_state():
         return {
             "status": "ORDER_CONFIRMED",
             "status_label": "Order Confirmed",
-            "quote_amount": event["amount"],
+            # A confirmed order is historical/completed.
+            # It must not remain displayed as the current active quote.
+            "quote_amount": None,
             "discount_percent": (
                 approval["approved_percent"]
                 if approval

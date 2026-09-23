@@ -267,9 +267,8 @@ with sales_tab:
 
     elif status == "ORDER_CONFIRMED":
 
-        st.success(
-            "🟢 ORDER CONFIRMED — "
-            f"{sales_state['order_id']}"
+        st.info(
+            "⚪ READY — Waiting for WhatsApp customer enquiry"
         )
 
 
@@ -436,23 +435,15 @@ with sales_tab:
 
             elif status == "ORDER_CONFIRMED":
 
-                with st.container(
-                    border=True
-                ):
+                st.success(
+                    "✓ No approvals currently "
+                    "require attention."
+                )
 
-                    st.success(
-                        "✓ DEAL COMPLETED"
-                    )
-
-                    st.write(
-                        "No further human action "
-                        "is required."
-                    )
-
-                    st.write(
-                        "**Order:** "
-                        f"{sales_state['order_id']}"
-                    )
+                st.caption(
+                    "The AI is operating within "
+                    "its authorised business rules."
+                )
 
 
             else:
