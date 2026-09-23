@@ -705,16 +705,39 @@ with sales_tab:
                         "AI Sales Agent's current commercial authority."
                     )
 
+                    # Customer account details come from the authoritative
+                    # customers table resolved earlier from request["phone"].
+                    customer_tier = (
+                        customer["account_tier"]
+                        if customer
+                        else "Unknown"
+                    )
+
+                    assigned_sales_rep = (
+                        customer["assigned_sales_rep"]
+                        if customer
+                        else "Unassigned"
+                    )
+
+                    # Commercial-authority approvals persist the actual
+                    # transaction value on the approval request.
+                    current_deal = request.get("order_value")
+
+                    if current_deal is not None:
+                        st.write(
+                            f"**Current Deal:** S${current_deal:,.2f}"
+                        )
+                    else:
+                        st.write(
+                            "**Current Deal:** Not available"
+                        )
+
                     st.write(
-                        "**Current Deal:** S$4,735.00"
+                        f"**Customer Tier:** {customer_tier}"
                     )
 
                     st.write(
-                        "**Customer Tier:** GOLD"
-                    )
-
-                    st.write(
-                        "**Assigned Sales Rep:** Marcus"
+                        f"**Assigned Sales Rep:** {assigned_sales_rep}"
                     )
 
                     st.divider()
