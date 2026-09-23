@@ -38,9 +38,14 @@ TRUST RULES (enforced here)
 MATCHING (lightweight, deterministic, case-insensitive)
 -------------------------------------------------------
 Strongest match wins:
-  1. Exact SKU match           (unique).
-  2. Exact product-name match  (unique).
-  3. Substring match across name/description/category (may be multiple).
+  1. Exact SKU match           (whole query equals a SKU) -> unique.
+  2. Exact product-name match  (whole query equals a name) -> unique.
+  3. Explicit SKU-token match  (a word in the query equals a real SKU, e.g.
+     "Industrial Cable CBL-210" or "10 units of CBL-210") -> unique (or
+     multiple if several distinct real SKUs are named). The token must equal
+     an ACTUAL catalogue SKU, so nothing is invented and a nonexistent SKU
+     never resolves.
+  4. Substring match across name/description/category (may be multiple).
 """
 
 from app.database import get_connection
@@ -50,6 +55,11 @@ from app.database import get_connection
 STATUS_UNIQUE_MATCH = "UNIQUE_MATCH"
 STATUS_MULTIPLE_MATCHES = "MULTIPLE_MATCHES"
 STATUS_NO_MATCH = "NO_MATCH"
+
+# Punctuation stripped from the EDGES of each query token before comparing it
+# to a real SKU (so "CBL-210," or "(CBL-210)" still matches the SKU "CBL-210").
+# Internal hyphens are preserved because they are part of the SKU itself.
+_SKU_TOKEN_STRIP = " \t\r\n.,;:!?()[]{}\"'"
 
 
 def _row_to_product(row):
@@ -128,7 +138,39 @@ def find_product(query):
                 "product": _row_to_product(row),
             }
 
-    # 3. Substring match across name / description / category.
+    # 3. EXPLICIT SKU-token match: the customer phrase contains an SKU as one
+    #    of its words (e.g. "10 units of Industrial Cable CBL-210"). An
+    #    explicit, valid SKU is the strongest signal of intent, so if any
+    #    whitespace-delimited token EXACTLY equals a real catalogue SKU
+    #    (case-insensitive, ignoring surrounding punctuation), resolve to that
+    #    trusted product. This is NOT fuzzy matching: the token must equal an
+    #    actual SKU from the authoritative products table, so an unknown or
+    #    "valid-looking" but nonexistent SKU (e.g. "ZZZ-999") never resolves
+    #    and no product/SKU is ever invented. Natural-language wording around
+    #    the SKU therefore cannot prevent a valid SKU from resolving.
+    query_tokens = {
+        token.strip(_SKU_TOKEN_STRIP).lower()
+        for token in needle.split()
+    }
+    query_tokens.discard("")
+    sku_token_matches = [
+        row for row in rows if row["sku"].lower() in query_tokens
+    ]
+    if len(sku_token_matches) == 1:
+        return {
+            "success": True,
+            "status": STATUS_UNIQUE_MATCH,
+            "product": _row_to_product(sku_token_matches[0]),
+        }
+    if len(sku_token_matches) > 1:
+        # Multiple distinct valid SKUs named in one phrase: never guess.
+        return {
+            "success": True,
+            "status": STATUS_MULTIPLE_MATCHES,
+            "candidates": [_row_to_product(row) for row in sku_token_matches],
+        }
+
+    # 4. Substring match across name / description / category.
     matches = []
     for row in rows:
         haystacks = [
