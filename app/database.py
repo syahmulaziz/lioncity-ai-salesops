@@ -1649,6 +1649,31 @@ def get_latest_sales_state():
         }
 
     # -------------------------------------------------
+    # Active quotation preview.
+    #
+    # A fresh quotation must take priority over any
+    # historical approval from an earlier transaction.
+    # -------------------------------------------------
+
+    if event["event_type"] == "QUOTATION_PREVIEW":
+
+        quote_amount = event["amount"]
+
+        if (
+            not isinstance(quote_amount, (int, float))
+            or isinstance(quote_amount, bool)
+        ):
+            quote_amount = None
+
+        return {
+            "status": "AI_HANDLING",
+            "status_label": "AI Handling Conversation",
+            "quote_amount": quote_amount,
+            "discount_percent": None,
+            "order_id": None,
+        }
+
+    # -------------------------------------------------
     # Human decision has been processed.
     #
     # We know the approved percentage, but we do NOT

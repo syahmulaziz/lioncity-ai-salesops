@@ -1412,8 +1412,25 @@ class SalesAgent:
             # section is also rendered this cycle, instead of reconstructing
             # any monetary value from Claude's draft text.
             result = generate_quotation_preview(self.enquiry)
+
             if isinstance(result, dict):
                 self._quotation_result_this_cycle = result
+
+                subtotal = self.enquiry.verified_subtotal
+
+                if (
+                    result.get("success")
+                    and isinstance(subtotal, (int, float))
+                    and not isinstance(subtotal, bool)
+                ):
+                    log_sales_event(
+                        event_type="QUOTATION_PREVIEW",
+                        phone=self.phone,
+                        customer_id=self.enquiry.customer_id,
+                        amount=float(subtotal),
+                        details=self.enquiry.product_sku,
+                    )
+
             return result
 
         # -------------------------------------------------
