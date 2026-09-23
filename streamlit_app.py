@@ -1,6 +1,8 @@
 import pandas as pd
 import requests
 import streamlit as st
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # HAFIZAH ADDED GET_COMMERCIAL_POLICIES AND UPDATE_COMMERCIAL_POLICY TO BE IMPORT
 from app.database import (
@@ -2426,6 +2428,24 @@ with dashboard_tab:
                 or ""
             )
 
+            if timestamp:
+                try:
+                    utc_time = datetime.strptime(
+                        timestamp,
+                        "%Y-%m-%d %H:%M:%S"
+                    ).replace(
+                        tzinfo=ZoneInfo("UTC")
+                    )
+
+                    timestamp = utc_time.astimezone(
+                        ZoneInfo("Asia/Singapore")
+                    ).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+
+                except ValueError:
+                    pass
+
             details = (
                 event.get("details")
                 or ""
@@ -2609,8 +2629,10 @@ with dashboard_tab:
                 if event.get("details"):
                     st.write(f"**Failure details:** {event['details']}")
 
-                if event.get("created_at"):
-                    st.caption(f"Failure recorded: {event['created_at']}")
+                if timestamp:
+                    st.caption(
+                        f"Failure recorded: {timestamp}"
+                    )
 
     st.divider()
 
