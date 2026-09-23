@@ -1394,24 +1394,107 @@ class SalesAgent:
             return result
 
         if tool_name == "request_human_handoff":
-            # Explicit, score-independent handoff. Works regardless of the
-            # triage band. Persistence lives in app/handoff.py (sales_events),
-            # completely separate from approval_requests.
+            # SCRUM-39: Claude selecting this tool is NOT itself proof that the
+            # customer explicitly requested a human. Verify the latest actual
+            # WhatsApp customer message before persisting a handoff.
+            latest_customer_text = ""
+
+            for message in reversed(self.messages):
+                if message.get("role") != "user":
+                    continue
+
+                content = message.get("content")
+
+                if not isinstance(content, str):
+                    continue
+
+                marker = "Customer message:\n"
+
+                if marker in content:
+                    latest_customer_text = (
+                        content.split(marker, 1)[1].strip()
+                    )
+                    break
+
+            normalised_text = latest_customer_text.lower()
+
+            # Require BOTH:
+            #   1) an explicit human/person reference, and
+            #   2) an explicit request to communicate with that person.
+            #
+            # This deliberately rejects order-progression phrases such as
+            # "please proceed", "go ahead", and "confirm the order".
+            human_terms = (
+                "human",
+                "person",
+                "salesperson",
+                "sales person",
+                "sales rep",
+                "sales representative",
+                "someone",
+            )
+
+            contact_terms = (
+                "speak",
+                "talk",
+                "call",
+                "contact",
+                "connect",
+                "transfer",
+                "refer",
+                "hand off",
+                "handoff",
+                "follow up",
+                "follow-up",
+            )
+
+            explicit_human_request = (
+                any(term in normalised_text for term in human_terms)
+                and any(term in normalised_text for term in contact_terms)
+            )
+
+            if not explicit_human_request:
+                # Do not mutate enquiry.human_requested, do not call
+                # record_handoff(), and do not allow the deterministic
+                # handoff acknowledgement to be rendered.
+                self._handoff_result_this_cycle = None
+
+                self.log_activity(
+                    "human_handoff_rejected",
+                    "Rejected handoff because the customer did not "
+                    "explicitly request a person",
+                    {
+                        "customer_message": latest_customer_text,
+                        "tool_input": tool_input,
+                    },
+                )
+
+                return {
+                    "success": False,
+                    "status": "NOT_REQUESTED",
+                    "error": "NO_EXPLICIT_HUMAN_REQUEST",
+                    "message": (
+                        "The customer did not explicitly ask to speak "
+                        "to a person or salesperson. Continue handling "
+                        "their sales request normally."
+                    ),
+                }
+
+            # Explicit, independently verified customer request.
             self.enquiry.apply_candidate({"human_requested": True})
+
             reason = (tool_input or {}).get(
                 "reason", "customer asked for a salesperson"
             )
+
             result = self._create_handoff(
-                trigger="explicit_request", reason=reason
+                trigger="explicit_request",
+                reason=reason,
             )
-            # MULTI-INTENT SAFETY: retain the trusted RECORDED/ERROR result
-            # for THIS response cycle so the finalizer can append a
-            # deterministic acknowledgement if a catalogue/delivery section
-            # is also rendered this cycle. Whether a human was actually
-            # notified is decided from THIS result only, never from Claude's
-            # wording.
+
             if isinstance(result, dict):
                 self._handoff_result_this_cycle = result
+
             return result
 
         if tool_name == "generate_quotation_preview":
