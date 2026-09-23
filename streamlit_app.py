@@ -160,17 +160,24 @@ with sales_tab:
 
     with metric_1:
 
+        # Show the current active customer from trusted sales state (resolved
+        # from the pending/active approval's phone). HITL pending must NOT
+        # blank this out.
+        active_customer = sales_state.get("company_name")
+
         st.metric(
             "Active Customer",
-            "—"
+            active_customer if active_customer else "—"
         )
 
 
     with metric_2:
 
+        account_tier = sales_state.get("account_tier")
+
         st.metric(
             "Account Tier",
-            "—"
+            account_tier if account_tier else "—"
         )
 
 
@@ -300,6 +307,35 @@ with sales_tab:
             st.info(
                 "WhatsApp sales activity is in progress."
             )
+
+            # -------------------------------------------------
+            # CURRENT DEAL CONTEXT (trusted state only).
+            #
+            # HITL pending must NOT erase the current deal, so show the
+            # trusted customer / quote that get_latest_sales_state() carries.
+            # Every value is optional and only shown when trusted state
+            # provides it (never fabricated).
+            # -------------------------------------------------
+            deal_company = sales_state.get("company_name")
+            deal_tier = sales_state.get("account_tier")
+            deal_quote = sales_state.get("quote_amount")
+            deal_requested = sales_state.get("requested_percent")
+
+            if deal_company:
+                st.write(f"**Customer:** {deal_company}")
+            if deal_tier:
+                st.write(f"**Account Tier:** {deal_tier}")
+            if deal_quote is not None:
+                st.write(
+                    f"**Current Quote:** S${deal_quote:,.2f}"
+                )
+            # While a discount is PENDING, show the requested % as PENDING -
+            # never as approved.
+            if status == "HUMAN_APPROVAL" and deal_requested is not None:
+                st.write(
+                    f"**Requested Discount (pending approval):** "
+                    f"{deal_requested:.0f}%"
+                )
 
         # -------------------------------------------------
         # CUSTOMER

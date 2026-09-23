@@ -572,11 +572,33 @@ async def receive_webhook(
 
             if requested_discount is not None:
 
+                # Persist the TRUSTED current quote context that already
+                # exists in the agent's verified enquiry state, so the Sales
+                # Console can still show the current deal (customer, quote)
+                # while the discount decision is PENDING. HITL must PAUSE the
+                # decision, not erase the existing sales context.
+                #
+                # Only genuinely verified values are persisted; nothing is
+                # fabricated. verified_subtotal / product_sku / quantity are
+                # set ONLY by trusted tool results (never customer/LLM text).
+                trusted_subtotal = getattr(
+                    agent.enquiry, "verified_subtotal", None
+                )
+                trusted_sku = getattr(
+                    agent.enquiry, "product_sku", None
+                )
+                trusted_quantity = getattr(
+                    agent.enquiry, "quantity", None
+                )
+
                 approval_result = (
                     create_approval_request(
                         phone=normalized_phone,
                         requested_percent=
                             requested_discount,
+                        order_value=trusted_subtotal,
+                        sku=trusted_sku,
+                        requested_quantity=trusted_quantity,
                     )
                 )
 
@@ -592,6 +614,10 @@ async def receive_webhook(
                     log_sales_event(
                         event_type="HUMAN_APPROVAL_REQUIRED",
                         phone=normalized_phone,
+                        # Record the trusted current quote (if known) so the
+                        # SalesOps timeline reflects the deal value at HITL
+                        # time; None when no verified subtotal exists.
+                        amount=trusted_subtotal,
                         details=(
                             f"Discount requested: "
                             f"{requested_discount}%"

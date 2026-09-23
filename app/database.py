@@ -1712,11 +1712,37 @@ def get_latest_sales_state():
         and approval["status"] == "PENDING"
     ):
 
+        # HITL PAUSES the decision - it must NOT erase the existing sales
+        # context. Surface the TRUSTED current quote and customer identity
+        # that were persisted when the approval was created, so the Sales
+        # Console can still show the active deal while the decision is
+        # pending. The requested discount stays PENDING and is exposed as
+        # `requested_percent` (NOT `discount_percent`/`decision`), so it is
+        # never presented as though it has already been approved.
+        #
+        # order_value holds the trusted subtotal captured at HITL time; it is
+        # only shown when it is a real persisted number (never fabricated).
+        pending_quote = approval.get("order_value")
+        if not isinstance(pending_quote, (int, float)) or isinstance(
+            pending_quote, bool
+        ):
+            pending_quote = None
+
+        customer = get_customer_by_phone(approval.get("phone"))
+
         return {
             "status": "HUMAN_APPROVAL",
             "status_label": "Human Approval Required",
-            "quote_amount": None,
+            "quote_amount": pending_quote,
             "discount_percent": None,
+            "requested_percent": approval.get("requested_percent"),
+            "phone": approval.get("phone"),
+            "company_name": (
+                customer.get("company_name") if customer else None
+            ),
+            "account_tier": (
+                customer.get("account_tier") if customer else None
+            ),
             "order_id": None,
         }
 
