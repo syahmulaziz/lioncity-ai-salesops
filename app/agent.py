@@ -1416,21 +1416,6 @@ class SalesAgent:
             if isinstance(result, dict):
                 self._quotation_result_this_cycle = result
 
-                subtotal = self.enquiry.verified_subtotal
-
-                if (
-                    result.get("success")
-                    and isinstance(subtotal, (int, float))
-                    and not isinstance(subtotal, bool)
-                ):
-                    log_sales_event(
-                        event_type="QUOTATION_PREVIEW",
-                        phone=self.phone,
-                        customer_id=self.enquiry.customer_id,
-                        amount=float(subtotal),
-                        details=self.enquiry.product_sku,
-                    )
-
             return result
 
         # -------------------------------------------------
@@ -2288,13 +2273,25 @@ class SalesAgent:
             self._evaluate_triage()
 
         elif tool_name == "get_customer_price":
-            # A successful pricing result carries a trusted 'subtotal'. The
-            # trusted setter records it as verified_subtotal (and ignores an
-            # unsuccessful result), which is what the large-value triage point
-            # keys off. Subtotal calculation stays in pricing.py; agent.py only
-            # forwards the trusted result.
+            # A successful pricing result carries a trusted subtotal.
+            # Persist it as the current active quotation for Sales Console.
             self.enquiry.set_verified_value(result)
             self._evaluate_triage()
+
+            subtotal = self.enquiry.verified_subtotal
+
+            if (
+                result.get("success")
+                and isinstance(subtotal, (int, float))
+                and not isinstance(subtotal, bool)
+            ):
+                log_sales_event(
+                    event_type="QUOTATION_PREVIEW",
+                    phone=self.phone,
+                    customer_id=self.enquiry.customer_id,
+                    amount=float(subtotal),
+                    details=self.enquiry.product_sku,
+                )
 
     def _evaluate_triage(self):
         """
