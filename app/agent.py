@@ -1094,6 +1094,20 @@ class SalesAgent:
         # reach the customer. None = no rejection was applied this cycle.
         self._discount_rejection_this_cycle = None
 
+        # COMMERCIAL AUTHORITY REJECTION.
+        #
+        # Set ONLY by apply_commercial_authority_rejection() from trusted
+        # application state (the rejected approval row's `reason` +
+        # `requested_percent`). When set, the finalizer emits an
+        # authoritative, deterministic, REASON-AWARE rejection message and
+        # never lets a model "your discount was approved / your order is
+        # placed" claim reach the customer. Unlike the discount rejection,
+        # this covers HIGH_QUANTITY / HIGH_VALUE / EXCESSIVE_DISCOUNT
+        # escalations (or combinations), so it must NOT be reduced to a pure
+        # discount rejection. None = no commercial rejection applied this
+        # cycle.
+        self._commercial_rejection_this_cycle = None
+
     def log_activity(
         self,
         activity_type: str,
@@ -1870,6 +1884,75 @@ class SalesAgent:
             "proceed."
         )
 
+    def _render_commercial_rejection_section(self):
+        """
+        Deterministically render the COMMERCIAL_AUTHORITY rejection portion of
+        the final response from the TRUSTED `_commercial_rejection_this_cycle`
+        snapshot only - never from Claude's draft text. Returns "" when no
+        commercial rejection was applied this response cycle.
+
+        This is the AUTHORITATIVE customer-facing statement of a REJECTED
+        commercial-authority decision. Unlike a plain discount rejection, the
+        escalation may be due to HIGH_QUANTITY, HIGH_VALUE, EXCESSIVE_DISCOUNT,
+        or any combination, so the wording is REASON-AWARE and read from the
+        trusted `reason` string. It:
+          - clearly states the requested transaction/terms were NOT approved;
+          - never claims a discount was approved;
+          - never claims an order was placed, reserved, created, or cancelled;
+          - is NOT phrased as "approve 0%";
+          - only invites the customer to proceed at standard pricing when the
+            escalation was purely about an EXCESSIVE_DISCOUNT (base pricing is
+            still available); for HIGH_QUANTITY / HIGH_VALUE it does NOT invent
+            an alternative quantity or price, and simply states the proposed
+            transaction could not be approved and offers to discuss options.
+        The reason + requested percent come from trusted application state.
+        """
+        snapshot = self._commercial_rejection_this_cycle
+        if not isinstance(snapshot, dict):
+            return ""
+
+        reason = snapshot.get("reason") or ""
+        reasons = {
+            token.strip()
+            for token in str(reason).split(",")
+            if token.strip()
+        }
+
+        has_discount = "EXCESSIVE_DISCOUNT" in reasons
+        has_other = bool(reasons - {"EXCESSIVE_DISCOUNT"})
+
+        requested = snapshot.get("requested_percent")
+        req_is_number = isinstance(requested, (int, float)) and not isinstance(
+            requested, bool
+        )
+        req_ok = req_is_number and math.isfinite(requested) and requested > 0
+
+        if has_discount and not has_other:
+            # Pure discount escalation: base pricing remains available, so the
+            # customer keeps the option to proceed at standard pricing.
+            if req_ok:
+                lead = (
+                    f"Your requested {requested:g}% discount could not be "
+                    f"approved."
+                )
+            else:
+                lead = "Your requested discount could not be approved."
+            return (
+                f"{lead} You can still continue at our standard/available "
+                "pricing if you'd like - just let me know how you'd like to "
+                "proceed."
+            )
+
+        # HIGH_QUANTITY / HIGH_VALUE (possibly combined with a discount): the
+        # proposed transaction as a whole exceeded what could be approved. Do
+        # NOT fabricate an alternative quantity or price.
+        return (
+            "Your requested order could not be approved as proposed, and no "
+            "order was placed. If you'd like, we can look at adjusting the "
+            "order or discuss other options - just let me know how you'd like "
+            "to proceed."
+        )
+
     def _render_order_confirmation_section(self):
         """
         Deterministically render an AUTHORITATIVE order confirmation from the
@@ -2090,12 +2173,16 @@ class SalesAgent:
         catalogue_section = self._render_catalogue_section()
         delivery_section = self._render_delivery_section()
         rejection_section = self._render_rejection_section()
+        commercial_rejection_section = (
+            self._render_commercial_rejection_section()
+        )
         order_confirmation_section = self._render_order_confirmation_section()
 
         if (
             catalogue_section
             or delivery_section
             or rejection_section
+            or commercial_rejection_section
             or order_confirmation_section
         ):
             # ORDER CONFIRMATION is an AUTHORITATIVE override: once the
@@ -2112,11 +2199,22 @@ class SalesAgent:
             # (a rejection continuation never creates an order), so at most
             # one of these leads; both compose safely with the trusted
             # catalogue/delivery/secondary sections below.
+            #
+            # COMMERCIAL AUTHORITY REJECTION is ALSO an AUTHORITATIVE override
+            # (same rationale as the discount rejection): a hostile "your
+            # discount was approved and your order is placed" draft can never
+            # reach the customer after a commercial escalation was rejected. A
+            # commercial rejection continuation never creates an order, so it
+            # is mutually exclusive with the order-confirmation section; and a
+            # single approval row is either DISCOUNT or COMMERCIAL_AUTHORITY,
+            # so at most one rejection section leads.
             sections = []
             if order_confirmation_section:
                 sections.append(order_confirmation_section)
             if rejection_section:
                 sections.append(rejection_section)
+            if commercial_rejection_section:
+                sections.append(commercial_rejection_section)
             sections.extend(
                 s for s in (catalogue_section, delivery_section) if s
             )
@@ -2163,6 +2261,13 @@ class SalesAgent:
                     "discount_rejection_render",
                     "Rendered authoritative discount-rejection reply from "
                     "trusted state instead of the model draft.",
+                    {"draft": draft_text},
+                )
+            if commercial_rejection_section:
+                self.log_activity(
+                    "commercial_rejection_render",
+                    "Rendered authoritative commercial-authority rejection "
+                    "reply from trusted state instead of the model draft.",
                     {"draft": draft_text},
                 )
             if catalogue_section:
@@ -2991,6 +3096,123 @@ class SalesAgent:
         self._reset_response_grounding()
         self._discount_rejection_this_cycle = {
             "requested_percent": requested_discount,
+        }
+
+        return self._continue_after_human_action()
+
+    def apply_commercial_authority_rejection(
+        self,
+        approval: dict
+    ):
+        """
+        Inject a TRUSTED human REJECTION of a COMMERCIAL_AUTHORITY escalation
+        into the existing conversation and let Claude resume.
+
+        This is the rejection counterpart of
+        apply_commercial_authority_approval(). A commercial-authority
+        escalation may be raised for HIGH_QUANTITY, HIGH_VALUE,
+        EXCESSIVE_DISCOUNT, or any combination, and is keyed off
+        `pending_commercial_order` (NOT `pending_approval`), so it must NOT
+        reuse apply_human_rejection() (which is discount-specific, requires a
+        pending_approval, and would otherwise return NO_PENDING_APPROVAL).
+
+        REJECT COMMERCIAL AUTHORITY != REJECT ORDER by the customer. This
+        method:
+          - takes the trusted `reason` + `requested_percent` from the rejected
+            approval ROW (passed in full), never from Claude's prose;
+          - ORDER SAFETY: clears `pending_commercial_order` (and any
+            `pending_approval`) so no later stray approval / repeated
+            /process-approvals can EVER resurrect the blocked order; it never
+            calls create_order and never links an order;
+          - injects trusted context stating the requested transaction/terms
+            were NOT approved, that no order was created/reserved/cancelled,
+            and (only for a pure EXCESSIVE_DISCOUNT escalation) that the
+            customer may still proceed at standard pricing;
+          - sets a deterministic, REASON-AWARE per-cycle rejection flag so the
+            shared finalizer emits the authoritative rejection message and can
+            never let a model "approved / order placed" claim reach the
+            customer;
+          - resumes via the SAME continuation path
+            (_continue_after_human_action + _finalize_customer_response).
+        """
+        reason = (approval.get("reason") if isinstance(approval, dict)
+                  else None) or ""
+        requested_percent = (
+            approval.get("requested_percent")
+            if isinstance(approval, dict) else None
+        )
+
+        self.log_activity(
+            "commercial_authority_rejection",
+            "Human rejected commercial transaction",
+            {
+                "approval_id": (
+                    approval.get("approval_id")
+                    if isinstance(approval, dict) else None
+                ),
+                "sku": (
+                    approval.get("sku")
+                    if isinstance(approval, dict) else None
+                ),
+                "requested_quantity": (
+                    approval.get("requested_quantity")
+                    if isinstance(approval, dict) else None
+                ),
+                "order_value": (
+                    approval.get("order_value")
+                    if isinstance(approval, dict) else None
+                ),
+                "requested_percent": requested_percent,
+                "reason": reason,
+            }
+        )
+
+        # ---------------------------------------------
+        # ORDER SAFETY: the escalation is rejected, so the blocked order must
+        # never be resumable. Clear BOTH the pending commercial order (the
+        # resurrection hazard: only apply_commercial_authority_approval()
+        # otherwise clears it) and any pending discount approval. After this,
+        # a stray later approval hits the pre-confirmation branch and does NOT
+        # create an order, and a repeated /process-approvals is a safe no-op.
+        # ---------------------------------------------
+        self.pending_commercial_order = None
+        self.pending_approval = None
+
+        # ---------------------------------------------
+        # Inject TRUSTED HUMAN context (commercial rejection).
+        # ---------------------------------------------
+        self.messages.append({
+            "role": "user",
+            "content": (
+                "[TRUSTED HUMAN SALES DECISION - COMMERCIAL TRANSACTION "
+                "REJECTED]\n"
+                "A sales representative reviewed the customer's requested "
+                "transaction, which had been escalated because it exceeded "
+                "the AI Sales Agent's commercial authority "
+                f"(reason: {reason or 'not specified'}), and did NOT approve "
+                "it.\n\n"
+                "This does NOT create, reserve, or place any order, does NOT "
+                "cancel an existing order, does NOT end the conversation, and "
+                "does NOT mean the customer declined to purchase.\n\n"
+                "Inform the customer that their requested order/terms could "
+                "not be approved as proposed. Do NOT claim that any discount "
+                "was approved. Do NOT claim that an order has been placed, "
+                "reserved, created, or cancelled. Do NOT invent an "
+                "alternative quantity or price. If the only reason was that "
+                "the requested discount exceeded authority, they may still "
+                "choose to proceed at the standard/available price; "
+                "otherwise, offer to discuss adjusting the order."
+            )
+        })
+
+        # Reset response-cycle grounding ONCE before starting this fresh
+        # rejection-continuation cycle, then set the trusted, reason-aware
+        # per-cycle rejection flag AFTER the reset (the reset clears it), so
+        # the finalizer renders the authoritative rejection message.
+        self._reset_response_grounding()
+        self._commercial_rejection_this_cycle = {
+            "reason": reason,
+            "requested_percent": requested_percent,
         }
 
         return self._continue_after_human_action()

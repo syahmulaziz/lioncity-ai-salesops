@@ -561,15 +561,38 @@ with sales_tab:
                             "and requires human approval."
                         )
 
-                        if st.button(
-                            "✓ Approve Commercial Transaction",
-                            type="primary",
-                            use_container_width=True,
-                            key=(
-                                f"approve_commercial_"
-                                f"{request['approval_id']}"
-                            ),
-                        ):
+                        # Approve / Reject live side by side and operate on
+                        # the SAME trusted approval_id. Rejection is a
+                        # distinct decision (NOT "approve 0%").
+                        (
+                            approve_commercial_col,
+                            reject_commercial_col,
+                        ) = st.columns(2)
+
+                        approve_commercial_clicked = (
+                            approve_commercial_col.button(
+                                "✓ Approve Commercial Transaction",
+                                type="primary",
+                                use_container_width=True,
+                                key=(
+                                    f"approve_commercial_"
+                                    f"{request['approval_id']}"
+                                ),
+                            )
+                        )
+
+                        reject_commercial_clicked = (
+                            reject_commercial_col.button(
+                                "✗ Reject Commercial Transaction",
+                                use_container_width=True,
+                                key=(
+                                    f"reject_commercial_"
+                                    f"{request['approval_id']}"
+                                ),
+                            )
+                        )
+
+                        if approve_commercial_clicked:
 
                             result = approve_request(
                                 approval_id=request["approval_id"],
@@ -652,6 +675,99 @@ with sales_tab:
                                         "Commercial approval was saved, "
                                         "but an error occurred while "
                                         "resuming the customer conversation."
+                                    )
+
+                                    st.code(str(error))
+
+                                st.rerun()
+
+                        if reject_commercial_clicked:
+
+                            # Record REJECTION in SQLite. Guarded to only
+                            # fire on a PENDING row (safe on double-click /
+                            # already-decided). This is NOT "approve 0%":
+                            # reject_request never sets approved_percent or
+                            # an order_id.
+                            result = reject_request(
+                                approval_id=request["approval_id"],
+                            )
+
+                            if not result["success"]:
+
+                                st.error(
+                                    "Rejection could not be recorded "
+                                    "(the request may already have been "
+                                    "decided)."
+                                )
+
+                            else:
+
+                                # Resume the SAME WhatsApp SalesAgent with
+                                # the trusted commercial rejection.
+                                try:
+
+                                    with st.spinner(
+                                        "Applying commercial rejection "
+                                        "and updating customer on WhatsApp..."
+                                    ):
+
+                                        api_response = requests.post(
+                                            "http://localhost:8000/"
+                                            "process-approvals",
+                                            timeout=90,
+                                        )
+
+                                    api_response.raise_for_status()
+
+                                    api_result = api_response.json()
+
+                                    approval_id = request["approval_id"]
+
+                                    if approval_id in api_result.get(
+                                        "processed",
+                                        [],
+                                    ):
+
+                                        st.success(
+                                            "✓ Commercial transaction "
+                                            "rejected and the customer has "
+                                            "been notified."
+                                        )
+
+                                    else:
+
+                                        st.error(
+                                            "Rejection was recorded, but "
+                                            "FastAPI did not apply it."
+                                        )
+
+                                        skipped = api_result.get(
+                                            "skipped",
+                                            [],
+                                        )
+
+                                        if skipped:
+                                            st.json(skipped)
+
+                                except requests.exceptions.ConnectionError:
+
+                                    st.error(
+                                        "Rejection was saved, but FastAPI "
+                                        "could not be reached."
+                                    )
+
+                                except requests.exceptions.Timeout:
+
+                                    st.error(
+                                        "Rejection was saved, but FastAPI "
+                                        "timed out."
+                                    )
+
+                                except Exception as error:
+
+                                    st.error(
+                                        "Rejection was saved, but an error "
+                                        "occurred while updating WhatsApp."
                                     )
 
                                     st.code(str(error))

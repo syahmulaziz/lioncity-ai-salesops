@@ -982,9 +982,22 @@ def process_approvals():
             "requested_percent"
         )
 
+        # A rejected row is either a DISCOUNT escalation or a
+        # COMMERCIAL_AUTHORITY escalation; they use DIFFERENT agent rejection
+        # paths (see below). Default to DISCOUNT for legacy rows with no
+        # explicit type.
+        approval_type = rejection.get(
+            "approval_type"
+        ) or "DISCOUNT"
+
         print(
             "\nRejection:",
             approval_id
+        )
+
+        print(
+            "Approval type:",
+            approval_type
         )
 
         print(
@@ -1015,9 +1028,20 @@ def process_approvals():
 
             continue
 
-        result = agent.apply_human_rejection(
-            requested_discount_percent=requested_percent
-        )
+        # COMMERCIAL_AUTHORITY escalations are keyed off
+        # pending_commercial_order (NOT pending_approval) and may reject a
+        # HIGH_QUANTITY / HIGH_VALUE / EXCESSIVE_DISCOUNT transaction, so they
+        # MUST use the dedicated commercial rejection path (which also clears
+        # pending_commercial_order for order safety). Discount escalations
+        # keep using the legacy discount rejection path.
+        if approval_type == "COMMERCIAL_AUTHORITY":
+            result = agent.apply_commercial_authority_rejection(
+                rejection
+            )
+        else:
+            result = agent.apply_human_rejection(
+                requested_discount_percent=requested_percent
+            )
 
         if not result.get("success"):
 
@@ -1047,13 +1071,21 @@ def process_approvals():
         # SALESOPS — HUMAN DECISION (REJECTION)
         # -------------------------------------------------
 
+        if approval_type == "COMMERCIAL_AUTHORITY":
+            rejection_details = (
+                "Rejected commercial transaction: "
+                f"{rejection.get('reason') or 'not specified'}"
+            )
+        else:
+            rejection_details = (
+                f"Rejected discount: "
+                f"{requested_percent}%"
+            )
+
         log_sales_event(
             event_type="HUMAN_APPROVAL_REJECTED",
             phone=phone,
-            details=(
-                f"Rejected discount: "
-                f"{requested_percent}%"
-            ),
+            details=rejection_details,
         )
 
         print(
