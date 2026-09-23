@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import requests
 from dotenv import load_dotenv
 
+from anthropic import Anthropic
+
 
 load_dotenv()
 
@@ -586,55 +588,89 @@ class GatewayClaudeClient:
 
 def get_claude_client():
     """
-    Create the LionCity LLM client using the hackathon
-    organizer's LLM gateway.
+    Create the LionCity LLM client.
 
-    Required .env variables:
+    LLM_PROVIDER=anthropic
+        Uses the personal Anthropic API directly.
 
-        LLM_GATEWAY_URL
-        LLM_GATEWAY_API_KEY
-        LLM_MODEL
+    LLM_PROVIDER=gateway
+        Uses the hackathon organizer's LLM gateway.
     """
 
-    gateway_url = os.getenv(
-        "LLM_GATEWAY_URL"
-    )
+    provider = os.getenv(
+        "LLM_PROVIDER",
+        "gateway"
+    ).strip().lower()
 
-    api_key = os.getenv(
-        "LLM_GATEWAY_API_KEY"
-    )
+    # =====================================================
+    # DIRECT ANTHROPIC API
+    # =====================================================
 
-    model = os.getenv(
-        "LLM_MODEL"
-    )
+    if provider == "anthropic":
 
-    missing = []
+        api_key = os.getenv(
+            "ANTHROPIC_API_KEY"
+        )
 
-    if not gateway_url:
-        missing.append(
+        if not api_key:
+            raise ValueError(
+                "LLM_PROVIDER is set to 'anthropic' "
+                "but ANTHROPIC_API_KEY is missing."
+            )
+
+        return Anthropic(
+            api_key=api_key
+        )
+
+    # =====================================================
+    # HACKATHON GATEWAY
+    # =====================================================
+
+    if provider == "gateway":
+
+        gateway_url = os.getenv(
             "LLM_GATEWAY_URL"
         )
 
-    if not api_key:
-        missing.append(
+        api_key = os.getenv(
             "LLM_GATEWAY_API_KEY"
         )
 
-    if not model:
-        missing.append(
+        model = os.getenv(
             "LLM_MODEL"
         )
 
-    if missing:
+        missing = []
 
-        raise ValueError(
-            "Missing required LLM gateway "
-            "environment variable(s): "
-            + ", ".join(missing)
+        if not gateway_url:
+            missing.append(
+                "LLM_GATEWAY_URL"
+            )
+
+        if not api_key:
+            missing.append(
+                "LLM_GATEWAY_API_KEY"
+            )
+
+        if not model:
+            missing.append(
+                "LLM_MODEL"
+            )
+
+        if missing:
+            raise ValueError(
+                "Missing required LLM gateway "
+                "environment variable(s): "
+                + ", ".join(missing)
+            )
+
+        return GatewayClaudeClient(
+            gateway_url=gateway_url,
+            api_key=api_key,
+            model=model
         )
 
-    return GatewayClaudeClient(
-        gateway_url=gateway_url,
-        api_key=api_key,
-        model=model
+    raise ValueError(
+        "Unsupported LLM_PROVIDER: "
+        f"{provider}. Expected 'gateway' or 'anthropic'."
     )
