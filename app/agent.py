@@ -1541,6 +1541,102 @@ class SalesAgent:
             return result
 
         # -------------------------------------------------
+        # SCRUM-44: CONSOLIDATE KNOWN COMMERCIAL AUTHORITY
+        # -------------------------------------------------
+        # If a discount requires human approval AND the current enquiry
+        # already has a complete trusted commercial snapshot (verified SKU,
+        # customer quantity, and verified subtotal), evaluate ALL authority
+        # dimensions now. This avoids a discount-only approval followed by a
+        # second approval for quantity/value that was already knowable.
+        #
+        # If the snapshot is incomplete, preserve the legacy discount-only
+        # flow. That is important for incremental scenarios where a customer
+        # adds quantity/value information later.
+        if tool_name == "check_discount_authority":
+            discount_result = check_discount_authority(
+                tool_input["requested_discount_percent"]
+            )
+
+            if not discount_result.get("requires_human_approval"):
+                return discount_result
+
+            trusted_sku = getattr(self.enquiry, "product_sku", None)
+            trusted_quantity = getattr(self.enquiry, "quantity", None)
+            trusted_value = getattr(
+                self.enquiry,
+                "verified_subtotal",
+                None,
+            )
+
+            complete_snapshot = (
+                trusted_sku is not None
+                and trusted_quantity is not None
+                and trusted_value is not None
+            )
+
+            if not complete_snapshot:
+                return discount_result
+
+            requested_discount = discount_result[
+                "requested_discount_percent"
+            ]
+
+            authority_result = evaluate_commercial_authority(
+                trusted_sku,
+                trusted_quantity,
+                trusted_value,
+                requested_discount,
+            )
+
+            if not authority_result.get("success"):
+                return authority_result
+
+            if not authority_result.get("requires_human_approval"):
+                return discount_result
+
+            existing_approval = get_matching_commercial_approval(
+                phone=self.phone,
+                sku=trusted_sku,
+                requested_quantity=trusted_quantity,
+                order_value=trusted_value,
+                discount_percent=requested_discount,
+            )
+
+            if existing_approval is not None:
+                authority_result["requires_human_approval"] = False
+                authority_result["human_approved"] = True
+                authority_result["approval"] = existing_approval
+                authority_result["requested_discount_percent"] = (
+                    requested_discount
+                )
+                authority_result["ai_authority_limit_percent"] = (
+                    discount_result.get("ai_authority_limit_percent")
+                )
+                authority_result["combined_commercial_approval"] = True
+                return authority_result
+
+            approval_result = create_approval_request(
+                phone=self.phone,
+                requested_percent=requested_discount,
+                approval_type="COMMERCIAL_AUTHORITY",
+                sku=trusted_sku,
+                requested_quantity=trusted_quantity,
+                order_value=trusted_value,
+                reason=",".join(authority_result.get("reasons", [])),
+            )
+
+            authority_result["approval"] = approval_result
+            authority_result["requested_discount_percent"] = (
+                requested_discount
+            )
+            authority_result["ai_authority_limit_percent"] = (
+                discount_result.get("ai_authority_limit_percent")
+            )
+            authority_result["combined_commercial_approval"] = True
+
+            return authority_result
+
+        # -------------------------------------------------
         # SCRUM-29: TRUSTED HUMAN-APPROVED DISCOUNT
         # -------------------------------------------------
 
@@ -2740,6 +2836,7 @@ class SalesAgent:
                     if (
                         block.name == "check_discount_authority"
                         and result.get("requires_human_approval")
+                        and not result.get("combined_commercial_approval")
                     ):
 
                         self.pending_approval = {
