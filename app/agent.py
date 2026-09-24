@@ -2696,6 +2696,158 @@ class SalesAgent:
 
         return result
 
+    def _reconcile_pending_commercial_approval(self):
+        """
+        SCRUM-44: reconcile a discount-only HITL created earlier in the
+        current agent turn once the complete trusted commercial snapshot
+        becomes available later in that same turn.
+
+        Claude may request check_discount_authority before pricing. In that
+        ordering, the discount tool correctly creates legacy pending state
+        because verified_subtotal is not known yet. If pricing subsequently
+        populates the trusted subtotal before send() returns, consolidate the
+        pending discount into one COMMERCIAL_AUTHORITY approval covering every
+        authority reason that is now knowable.
+
+        This method uses only trusted EnquiryState values for SKU/value and
+        the application-held pending discount request. It never reconstructs
+        commercial facts from Claude prose.
+        """
+        pending = getattr(self, "pending_approval", None)
+
+        if not isinstance(pending, dict):
+            return {
+                "success": True,
+                "combined_commercial_approval": False,
+                "reason": "NO_PENDING_DISCOUNT_APPROVAL",
+            }
+
+        if pending.get("type") != "DISCOUNT":
+            return {
+                "success": True,
+                "combined_commercial_approval": False,
+                "reason": "NOT_DISCOUNT_APPROVAL",
+            }
+
+        if pending.get("status") != "PENDING":
+            return {
+                "success": True,
+                "combined_commercial_approval": False,
+                "reason": "DISCOUNT_APPROVAL_NOT_PENDING",
+            }
+
+        requested_discount = pending.get(
+            "requested_discount_percent"
+        )
+
+        trusted_sku = getattr(
+            self.enquiry,
+            "product_sku",
+            None,
+        )
+        trusted_quantity = getattr(
+            self.enquiry,
+            "quantity",
+            None,
+        )
+        trusted_value = getattr(
+            self.enquiry,
+            "verified_subtotal",
+            None,
+        )
+
+        complete_snapshot = (
+            trusted_sku is not None
+            and trusted_quantity is not None
+            and trusted_value is not None
+            and requested_discount is not None
+        )
+
+        if not complete_snapshot:
+            return {
+                "success": True,
+                "combined_commercial_approval": False,
+                "reason": "COMMERCIAL_SNAPSHOT_INCOMPLETE",
+            }
+
+        authority_result = evaluate_commercial_authority(
+            trusted_sku,
+            trusted_quantity,
+            trusted_value,
+            requested_discount,
+        )
+
+        if not authority_result.get("success"):
+            return authority_result
+
+        if not authority_result.get(
+            "requires_human_approval"
+        ):
+            return {
+                "success": True,
+                "combined_commercial_approval": False,
+                "reason": "NO_COMBINED_AUTHORITY_REQUIRED",
+            }
+
+        existing_approval = get_matching_commercial_approval(
+            phone=self.phone,
+            sku=trusted_sku,
+            requested_quantity=trusted_quantity,
+            order_value=trusted_value,
+            discount_percent=requested_discount,
+        )
+
+        if existing_approval is not None:
+            approval_result = existing_approval
+        else:
+            approval_result = create_approval_request(
+                phone=self.phone,
+                requested_percent=requested_discount,
+                approval_type="COMMERCIAL_AUTHORITY",
+                sku=trusted_sku,
+                requested_quantity=trusted_quantity,
+                order_value=trusted_value,
+                reason=",".join(
+                    authority_result.get("reasons", [])
+                ),
+            )
+
+        # The combined commercial approval supersedes the temporary
+        # in-memory legacy discount HITL. Clearing it prevents
+        # whatsapp_api.py from persisting a second DISCOUNT approval.
+        self.pending_approval = None
+
+        authority_result["approval"] = approval_result
+        authority_result["requested_discount_percent"] = (
+            requested_discount
+        )
+        authority_result["ai_authority_limit_percent"] = (
+            pending.get("ai_authority_limit_percent")
+        )
+        authority_result["combined_commercial_approval"] = True
+
+        self.log_activity(
+            "commercial_approval_reconciled",
+            (
+                "Consolidated discount HITL into combined "
+                "commercial authority approval"
+            ),
+            {
+                "sku": trusted_sku,
+                "quantity": trusted_quantity,
+                "order_value": trusted_value,
+                "discount_percent": requested_discount,
+                "reasons": authority_result.get("reasons", []),
+                "approval_id": (
+                    approval_result.get("approval_id")
+                    if isinstance(approval_result, dict)
+                    else None
+                ),
+            },
+        )
+
+        return authority_result
+
     def send(self, customer_message: str):
         """
         Send a new customer message into the existing
@@ -2803,6 +2955,7 @@ class SalesAgent:
             })
 
             tool_results = []
+            discount_tool_result_index = None
 
             for block in response.content:
 
@@ -2876,6 +3029,28 @@ class SalesAgent:
                     "tool_use_id": block.id,
                     "content": json.dumps(result)
                 })
+
+                if block.name == "check_discount_authority":
+                    discount_tool_result_index = (
+                        len(tool_results) - 1
+                    )
+
+            # SCRUM-44: Claude can check discount authority before pricing
+            # in the SAME tool-use batch. Reconcile after every tool in the
+            # batch has executed, when trusted pricing may now be available.
+            reconciliation = (
+                self._reconcile_pending_commercial_approval()
+            )
+
+            if (
+                reconciliation.get("combined_commercial_approval")
+                and discount_tool_result_index is not None
+            ):
+                # Return the consolidated authority result to Claude instead
+                # of the now-obsolete discount-only observation.
+                tool_results[
+                    discount_tool_result_index
+                ]["content"] = json.dumps(reconciliation)
 
             # -----------------------------------------
             # Return tool observations to Claude.
@@ -3561,3 +3736,127 @@ class SalesAgent:
             "success": True,
             "response": final_text
         }
+
+def test_scrum44_pricing_first_then_discount_stays_combined(
+    monkeypatch,
+):
+    """
+    SCRUM-44 reverse-order regression.
+
+    If trusted pricing is already available BEFORE Claude checks
+    discount authority, the request must immediately become one
+    combined COMMERCIAL_AUTHORITY HITL.
+
+    No legacy DISCOUNT pending state may survive.
+    """
+
+    agent = _build_agent()
+
+    # Complete trusted snapshot already exists.
+    agent.enquiry.product_sku = "ADP-120"
+    agent.enquiry.quantity = 100
+    agent.enquiry.verified_subtotal = 1800.0
+
+    monkeypatch.setattr(
+        agent_module,
+        "check_discount_authority",
+        lambda requested_discount_percent: {
+            "success": True,
+            "requested_discount_percent":
+                requested_discount_percent,
+            "ai_authority_limit_percent": 5.0,
+            "requires_human_approval": True,
+        },
+    )
+
+    authority_calls = []
+    created_approvals = []
+
+    def fake_evaluate(
+        sku,
+        quantity,
+        order_value,
+        discount_percent,
+    ):
+        authority_calls.append({
+            "sku": sku,
+            "quantity": quantity,
+            "order_value": order_value,
+            "discount_percent": discount_percent,
+        })
+
+        return {
+            "success": True,
+            "requires_human_approval": True,
+            "reasons": [
+                "HIGH_VALUE",
+                "EXCESSIVE_DISCOUNT",
+            ],
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_commercial_authority",
+        fake_evaluate,
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "get_matching_commercial_approval",
+        lambda **kwargs: None,
+    )
+
+    def fake_create_approval_request(**kwargs):
+        created_approvals.append(kwargs)
+
+        return {
+            "success": True,
+            "approval_id": 4408,
+            "already_exists": False,
+            **kwargs,
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "create_approval_request",
+        fake_create_approval_request,
+    )
+
+    result = agent._handle_tool(
+        "check_discount_authority",
+        {
+            "requested_discount_percent": 10.0,
+        },
+    )
+
+    assert result["success"] is True
+    assert result["requires_human_approval"] is True
+    assert result["combined_commercial_approval"] is True
+
+    assert len(authority_calls) == 1
+
+    assert authority_calls[0] == {
+        "sku": "ADP-120",
+        "quantity": 100,
+        "order_value": 1800.0,
+        "discount_percent": 10.0,
+    }
+
+    assert len(created_approvals) == 1
+
+    approval = created_approvals[0]
+
+    assert (
+        approval["approval_type"]
+        == "COMMERCIAL_AUTHORITY"
+    )
+
+    assert set(
+        approval["reason"].split(",")
+    ) == {
+        "HIGH_VALUE",
+        "EXCESSIVE_DISCOUNT",
+    }
+
+    # No legacy discount state should exist.
+    assert agent.pending_approval is None

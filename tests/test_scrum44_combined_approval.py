@@ -642,3 +642,250 @@ def test_scrum44_combined_approval_does_not_create_legacy_discount_pending_state
     # combined commercial HITL must not manufacture the
     # old second DISCOUNT state.
     assert agent.pending_approval is None
+
+def test_scrum44_late_pricing_consolidates_earlier_discount_hitl(
+    monkeypatch,
+):
+    """
+    SCRUM-44 AWS regression.
+
+    Claude may check discount authority BEFORE the pricing tool
+    has populated verified_subtotal during the same agent turn.
+
+    Once trusted pricing becomes available later in that turn,
+    the earlier discount-only HITL must be reconciled into one
+    combined commercial-authority approval.
+    """
+
+    agent = _build_agent()
+
+    # Product + quantity are already known, but pricing is NOT.
+    agent.enquiry.product_sku = "ADP-120"
+    agent.enquiry.quantity = 100
+    agent.enquiry.verified_subtotal = None
+
+    # Step 1: discount check happens too early.
+    agent.pending_approval = {
+        "type": "DISCOUNT",
+        "requested_discount_percent": 10.0,
+        "ai_authority_limit_percent": 5.0,
+        "status": "PENDING",
+    }
+
+    # Step 2: later in the SAME turn trusted pricing arrives.
+    agent.enquiry.verified_subtotal = 1800.0
+
+    authority_calls = []
+    created_approvals = []
+
+    def fake_evaluate(
+        sku,
+        quantity,
+        order_value,
+        discount_percent,
+    ):
+        authority_calls.append({
+            "sku": sku,
+            "quantity": quantity,
+            "order_value": order_value,
+            "discount_percent": discount_percent,
+        })
+
+        return {
+            "success": True,
+            "requires_human_approval": True,
+            "reasons": [
+                "HIGH_VALUE",
+                "EXCESSIVE_DISCOUNT",
+            ],
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_commercial_authority",
+        fake_evaluate,
+    )
+
+    def fake_create_approval_request(**kwargs):
+        created_approvals.append(kwargs)
+
+        return {
+            "success": True,
+            "approval_id": 4407,
+            "already_exists": False,
+            **kwargs,
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "create_approval_request",
+        fake_create_approval_request,
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "get_matching_commercial_approval",
+        lambda **kwargs: None,
+    )
+
+    # This helper does not exist yet.
+    # Step 3 will add it to SalesAgent.
+    result = agent._reconcile_pending_commercial_approval()
+
+    assert result["success"] is True
+    assert result["combined_commercial_approval"] is True
+
+    assert len(authority_calls) == 1
+
+    assert authority_calls[0] == {
+        "sku": "ADP-120",
+        "quantity": 100,
+        "order_value": 1800.0,
+        "discount_percent": 10.0,
+    }
+
+    assert len(created_approvals) == 1
+
+    approval = created_approvals[0]
+
+    assert (
+        approval["approval_type"]
+        == "COMMERCIAL_AUTHORITY"
+    )
+
+    reasons = set(
+        approval["reason"].split(",")
+    )
+
+    assert reasons == {
+        "HIGH_VALUE",
+        "EXCESSIVE_DISCOUNT",
+    }
+
+    # Most important:
+    # obsolete legacy discount state must be gone.
+    assert agent.pending_approval is None
+
+def test_scrum44_pricing_first_then_discount_stays_combined(
+    monkeypatch,
+):
+    """
+    SCRUM-44 reverse-order regression.
+
+    If trusted pricing is already available BEFORE Claude checks
+    discount authority, the request must immediately become one
+    combined COMMERCIAL_AUTHORITY HITL.
+
+    No legacy DISCOUNT pending state may survive.
+    """
+
+    agent = _build_agent()
+
+    # Complete trusted snapshot already exists.
+    agent.enquiry.product_sku = "ADP-120"
+    agent.enquiry.quantity = 100
+    agent.enquiry.verified_subtotal = 1800.0
+
+    monkeypatch.setattr(
+        agent_module,
+        "check_discount_authority",
+        lambda requested_discount_percent: {
+            "success": True,
+            "requested_discount_percent":
+                requested_discount_percent,
+            "ai_authority_limit_percent": 5.0,
+            "requires_human_approval": True,
+        },
+    )
+
+    authority_calls = []
+    created_approvals = []
+
+    def fake_evaluate(
+        sku,
+        quantity,
+        order_value,
+        discount_percent,
+    ):
+        authority_calls.append({
+            "sku": sku,
+            "quantity": quantity,
+            "order_value": order_value,
+            "discount_percent": discount_percent,
+        })
+
+        return {
+            "success": True,
+            "requires_human_approval": True,
+            "reasons": [
+                "HIGH_VALUE",
+                "EXCESSIVE_DISCOUNT",
+            ],
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_commercial_authority",
+        fake_evaluate,
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "get_matching_commercial_approval",
+        lambda **kwargs: None,
+    )
+
+    def fake_create_approval_request(**kwargs):
+        created_approvals.append(kwargs)
+
+        return {
+            "success": True,
+            "approval_id": 4408,
+            "already_exists": False,
+            **kwargs,
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "create_approval_request",
+        fake_create_approval_request,
+    )
+
+    result = agent._handle_tool(
+        "check_discount_authority",
+        {
+            "requested_discount_percent": 10.0,
+        },
+    )
+
+    assert result["success"] is True
+    assert result["requires_human_approval"] is True
+    assert result["combined_commercial_approval"] is True
+
+    assert len(authority_calls) == 1
+
+    assert authority_calls[0] == {
+        "sku": "ADP-120",
+        "quantity": 100,
+        "order_value": 1800.0,
+        "discount_percent": 10.0,
+    }
+
+    assert len(created_approvals) == 1
+
+    approval = created_approvals[0]
+
+    assert (
+        approval["approval_type"]
+        == "COMMERCIAL_AUTHORITY"
+    )
+
+    assert set(
+        approval["reason"].split(",")
+    ) == {
+        "HIGH_VALUE",
+        "EXCESSIVE_DISCOUNT",
+    }
+
+    # No legacy discount state should exist.
+    assert agent.pending_approval is None
