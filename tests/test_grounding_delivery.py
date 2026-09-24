@@ -460,7 +460,7 @@ def test_wrong_checked_date_in_draft_is_corrected(monkeypatch):
     result = agent.send("Can you deliver tomorrow to Tengah?")
     reply = result["response"]
     # Final response must reference the TRUSTED checked date...
-    assert "2026-09-22" in reply
+    assert "22-09-2026" in reply
     # ...and must NOT present the model's different date as the checked one.
     assert "23 September" not in reply
     assert "23 Sep" not in reply
@@ -494,7 +494,7 @@ def test_correct_checked_date_matches_and_is_shown(monkeypatch):
     result = agent.send("Can you deliver to Tengah on 2026-09-22?")
     reply = result["response"]
     assert "Tengah" in reply
-    assert "2026-09-22" in reply
+    assert "22-09-2026" in reply
     assert "unavailable" in reply.lower()
 
 
@@ -614,7 +614,7 @@ def test_multi_intent_delivery_and_quotation_both_present(monkeypatch):
     reply = result["response"]
     # Trusted delivery grounding still applies (G01-G05 unaffected).
     assert "Nowhere-Zone" in reply
-    assert "2099-01-01" in reply
+    assert "01-01-2099" in reply
     assert "can't confirm" in reply.lower() or "cannot confirm" in reply.lower()
     # The LEGITIMATE quotation preview (trusted, TBC-filled) is restored...
     assert "*Quotation Preview*" in reply

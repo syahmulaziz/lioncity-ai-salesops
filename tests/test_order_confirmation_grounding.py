@@ -97,6 +97,12 @@ def test_successful_order_yields_trusted_confirmation_not_needs_approval(
     lower = reply.lower()
     assert ("order" in lower and ("confirm" in lower or "created" in lower))
 
+    # SCRUM-41: customer-facing delivery date uses DD-MM-YYYY.
+    assert "Delivery: Tuas on 23-09-2026" in reply
+
+    # Internal ISO date must not leak into customer-facing confirmation.
+    assert "2026-09-23" not in reply
+
     # returned == stored assistant history.
     stored = None
     for m in reversed(agent.messages):

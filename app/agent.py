@@ -42,6 +42,24 @@ from app.handoff import record_handoff
 from app.quotation import generate_quotation_preview
 
 
+def _format_customer_date(value):
+    """
+    Format an internal ISO date (YYYY-MM-DD) for customer-facing text.
+
+    Internal/tool/database dates remain unchanged.
+    """
+    if not value:
+        return value
+
+    try:
+        return datetime.strptime(
+            str(value),
+            "%Y-%m-%d",
+        ).strftime("%d-%m-%Y")
+    except (TypeError, ValueError):
+        return str(value)
+
+
 MODEL_NAME = "claude-sonnet-4-5"
 
 TOOLS = [
@@ -1786,8 +1804,10 @@ class SalesAgent:
 
         area = snapshot.get("delivery_area")
         checked_date = snapshot.get("delivery_date")
-        location = f"{area} on {checked_date}" if area and checked_date else (
-            area or checked_date or "that request"
+        display_date = _format_customer_date(checked_date)
+
+        location = f"{area} on {display_date}" if area and display_date else (
+            area or display_date or "that request"
         )
 
         if snapshot.get("available") is not True:
@@ -2092,8 +2112,12 @@ class SalesAgent:
 
         area = snapshot.get("delivery_area")
         date = snapshot.get("delivery_date")
-        if area and date:
-            lines.append(f"Delivery: {area} on {date}")
+        display_date = _format_customer_date(date)
+
+        if area and display_date:
+            lines.append(
+                f"Delivery: {area} on {display_date}"
+            )
         elif area:
             lines.append(f"Delivery: {area}")
 
