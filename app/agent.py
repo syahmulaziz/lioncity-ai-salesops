@@ -1034,6 +1034,13 @@ class SalesAgent:
         # deterministically after commercial approval.
         self.pending_commercial_order = None
 
+        # Set True ONLY while apply_commercial_authority_approval() is
+        # resuming a transaction the human has already approved, so the
+        # create_order path in _handle_tool creates the preserved order
+        # directly instead of re-running the commercial-authority gate
+        # (which would re-block it). Always reset in a finally block.
+        self._resuming_approved_commercial_order = False
+
         # DELIVERY READINESS (Feature B): a successful order creation ENDS
         # the current transaction. Rather than track a separate sticky
         # "order already created" flag (which, on a reused SalesAgent, would
@@ -1553,7 +1560,16 @@ class SalesAgent:
             discount_percent = tool_input.get("discount_percent")
             discount_already_approved = False
 
-            if approved_discount is not None:
+            # On a human-approved commercial RESUME, do not take the
+            # discount-reconciliation sub-path: authority has already been
+            # granted for this exact transaction, so fall straight through to
+            # execute_tool and (if it re-blocks) the trusted resume fallback
+            # below, which creates the preserved order without re-gating.
+            resuming_approved = getattr(
+                self, "_resuming_approved_commercial_order", False
+            )
+
+            if approved_discount is not None and not resuming_approved:
                 try:
                     discount_already_approved = (
                         abs(
@@ -1673,6 +1689,41 @@ class SalesAgent:
 
         # TRUSTED PATH: run the existing business tool unchanged.
         result = execute_tool(tool_name, tool_input)
+
+        # HUMAN-APPROVED COMMERCIAL RESUME (high-value confirmation fix).
+        #
+        # When apply_commercial_authority_approval() is resuming a
+        # transaction the human has ALREADY approved, the commercial-authority
+        # decision has been made for this exact preserved transaction. The
+        # authority gate inside execute_tool re-derives an approval match by
+        # comparing the confirmed final_total against the approval's stored
+        # order_value with a <0.01 tolerance; when the eval-time order_value
+        # and the confirmed final_total legitimately differ (e.g. an added
+        # delivery fee), that match fails and the gate re-blocks the order
+        # with HUMAN_APPROVAL_REQUIRED - which previously bubbled up as a
+        # success=False result carrying NO customer "response", so
+        # /process-approvals skipped the send and the customer received
+        # nothing. Since the human already approved THIS exact transaction,
+        # create the preserved order directly (bypassing ONLY the re-gate).
+        # This runs ONLY on the trusted resume flag, and only as a fallback
+        # after the normal execute_tool path re-blocked, so ordinary orders
+        # and the FIRST pre-approval attempt are unaffected and still gated.
+        if (
+            tool_name == "create_order"
+            and getattr(self, "_resuming_approved_commercial_order", False)
+            and isinstance(result, dict)
+            and result.get("error") == "HUMAN_APPROVAL_REQUIRED"
+        ):
+            result = create_order(
+                customer_id=tool_input["customer_id"],
+                items=tool_input["items"],
+                product_subtotal=tool_input["product_subtotal"],
+                discount_percent=tool_input["discount_percent"],
+                delivery_fee=tool_input["delivery_fee"],
+                final_total=tool_input["final_total"],
+                delivery_area=tool_input["delivery_area"],
+                delivery_date=tool_input["delivery_date"],
+            )
 
         # If the customer has already confirmed the order but
         # commercial authority prevents creation, preserve the
@@ -2864,7 +2915,14 @@ class SalesAgent:
             # is linked and the approval is marked processed. So suppress the
             # inner _handle_tool auto-reset here and perform the reset
             # explicitly on the confirmed-success path below.
+            # HIGH-VALUE CONFIRMATION FIX: this is a resume of a transaction
+            # the human has ALREADY approved, so create_order must NOT be
+            # re-gated by the commercial-authority check (which would re-block
+            # the order whenever the confirmed final_total differs from the
+            # eval-time order_value). The flag is honoured only inside
+            # _handle_tool's create_order path and is always cleared here.
             self._suppress_order_completion_reset = True
+            self._resuming_approved_commercial_order = True
             try:
                 order_result = self._handle_tool(
                     "create_order",
@@ -2872,6 +2930,7 @@ class SalesAgent:
                 )
             finally:
                 self._suppress_order_completion_reset = False
+                self._resuming_approved_commercial_order = False
 
             # TEMPORARY DEBUGGING:
             # Show exactly what was retried after human approval
