@@ -1411,3 +1411,194 @@ def test_scrum44_successful_order_overrides_stale_claude_finalization_message(
     assert "will be in touch" not in lower
     assert "finalize this order" not in lower
     assert "finalise this order" not in lower
+
+def test_scrum44_order_success_cannot_be_retried_when_approval_link_fails(
+    monkeypatch,
+):
+    """
+    SCRUM-44 AWS regression.
+
+    Once create_order has successfully persisted an order, a later
+    approval-link/bookkeeping failure must NEVER turn that successful
+    order into a tool failure that Claude can retry.
+
+    AWS previously created TWO real orders from one customer
+    confirmation because:
+        create_order succeeded
+        -> set_approval_order_id failed
+        -> tool reported failure
+        -> Claude called create_order again.
+    """
+
+    import types
+
+    agent = _build_agent()
+    agent._reset_response_grounding()
+
+    agent.max_iterations = 10
+    agent.system_prompt = agent_module.SYSTEM_PROMPT
+
+    agent.approved_commercial_discount_percent = 8.0
+    agent.approved_commercial_approval_id = 4413
+    agent._resuming_approved_commercial_order = False
+
+    # Trusted transaction state needed by the finalizer / lifecycle.
+    agent.enquiry.product_sku = "ADP-120"
+    agent.enquiry.quantity = 100
+    agent.enquiry.verified_subtotal = 1800.0
+
+    create_order_calls = []
+
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_commercial_authority",
+        lambda sku, quantity, order_value, discount_percent: {
+            "success": True,
+            "requires_human_approval": True,
+            "reasons": [
+                "HIGH_VALUE",
+                "EXCESSIVE_DISCOUNT",
+            ],
+        },
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "get_matching_commercial_approval",
+        lambda **kwargs: {
+            "approval_id": 4413,
+            "phone": TEST_PHONE,
+            "approval_type": "COMMERCIAL_AUTHORITY",
+            "status": "APPROVED",
+            "sku": "ADP-120",
+            "requested_quantity": 100,
+            "order_value": 1800.0,
+            "requested_percent": 10.0,
+            "approved_percent": 8.0,
+            "reason": "HIGH_VALUE,EXCESSIVE_DISCOUNT",
+        },
+    )
+
+    def fake_create_order(**kwargs):
+        create_order_calls.append(kwargs)
+
+        return {
+            "success": True,
+            "order_id": "SO-SCRUM44-4413",
+            "customer_id": "CUST-001",
+            "status": "CONFIRMED",
+            "items": kwargs["items"],
+            "product_subtotal": kwargs["product_subtotal"],
+            "discount_percent": kwargs["discount_percent"],
+            "delivery_fee": kwargs["delivery_fee"],
+            "final_total": kwargs["final_total"],
+            "delivery_area": kwargs["delivery_area"],
+            "delivery_date": kwargs["delivery_date"],
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "create_order",
+        fake_create_order,
+    )
+
+    # Reproduce the exact AWS failure:
+    # order persistence succeeds, but approval bookkeeping fails AFTERWARD.
+    def failing_approval_link(approval_id, order_id):
+        raise RuntimeError("simulated approval-link failure")
+
+    monkeypatch.setattr(
+        agent_module,
+        "set_approval_order_id",
+        failing_approval_link,
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "mark_approval_processed",
+        lambda approval_id: None,
+    )
+
+    agent.log_activity = lambda *args, **kwargs: None
+
+    order_tool_use = types.SimpleNamespace(
+        type="tool_use",
+        id="toolu_scrum44_4413",
+        name="create_order",
+        input={
+            "phone": TEST_PHONE,
+            "customer_id": "CUST-001",
+            "items": [
+                {
+                    "sku": "ADP-120",
+                    "quantity": 100,
+                    "unit_price": 18.0,
+                }
+            ],
+            "product_subtotal": 1800.0,
+            "discount_percent": 8.0,
+            "delivery_fee": 30.0,
+            "final_total": 1686.0,
+            "delivery_area": "Tengah",
+            "delivery_date": "2026-09-26",
+        },
+    )
+
+    first_response = types.SimpleNamespace(
+        stop_reason="tool_use",
+        content=[order_tool_use],
+    )
+
+    # This represents what happened on AWS: if the first successful order
+    # is incorrectly reported as a tool failure, Claude gets another turn
+    # and attempts create_order again.
+    second_order_tool_use = types.SimpleNamespace(
+        type="tool_use",
+        id="toolu_scrum44_4413_retry",
+        name="create_order",
+        input=order_tool_use.input.copy(),
+    )
+
+    second_response = types.SimpleNamespace(
+        stop_reason="tool_use",
+        content=[second_order_tool_use],
+    )
+
+    responses = iter([
+        first_response,
+        second_response,
+    ])
+
+    agent.client = types.SimpleNamespace(
+        messages=types.SimpleNamespace(
+            create=lambda **kwargs: next(responses)
+        )
+    )
+
+    result = agent.send("Yes please proceed.")
+
+    # The persisted order is authoritative even though subsequent
+    # approval bookkeeping failed.
+    assert result["success"] is True
+
+    # CRITICAL IDEMPOTENCY CONTRACT:
+    # one customer confirmation may persist at most ONE order.
+    assert len(create_order_calls) == 1
+
+    assert agent._order_result_this_cycle is not None
+    assert (
+        agent._order_result_this_cycle["order_id"]
+        == "SO-SCRUM44-4413"
+    )
+
+    response = result["response"]
+
+    assert "SO-SCRUM44-4413" in response
+    assert "8%" in response
+    assert "1,686" in response
+
+    lower = response.lower()
+
+    assert "technical issue creating" not in lower
+    assert "finalize" not in lower
+    assert "finalise" not in lower

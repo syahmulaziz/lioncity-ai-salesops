@@ -1886,9 +1886,22 @@ class SalesAgent:
                 self.pending_commercial_order.copy(),
             )
 
-        # SCRUM-44: a commercial approval granted BEFORE customer
-        # confirmation is consumed only after the customer later confirms and
-        # the real order has been persisted successfully.
+        # SCRUM-44: once create_order has successfully persisted an order,
+        # that success is authoritative. Capture it BEFORE secondary approval
+        # bookkeeping so a bookkeeping failure can never be reported to Claude
+        # as an order-creation failure (which would allow a duplicate retry).
+        if (
+            tool_name == "create_order"
+            and isinstance(result, dict)
+            and result.get("success")
+        ):
+            self._order_result_this_cycle = result
+
+        # A commercial approval granted BEFORE customer confirmation is linked
+        # only after the customer later confirms and the real order is persisted.
+        # This linkage is secondary bookkeeping. If it fails, preserve the real
+        # order success, leave the approval unresolved for reconciliation, and
+        # log the problem instead of returning success=False.
         preconfirm_approval_id = getattr(
             self, "approved_commercial_approval_id", None
         )
@@ -1902,24 +1915,36 @@ class SalesAgent:
                 self, "_resuming_approved_commercial_order", False
             )
         ):
-            link_result = set_approval_order_id(
-                approval_id=preconfirm_approval_id,
-                order_id=result.get("order_id"),
-            )
+            try:
+                link_result = set_approval_order_id(
+                    approval_id=preconfirm_approval_id,
+                    order_id=result.get("order_id"),
+                )
 
-            if not link_result.get("success"):
-                return {
-                    "success": False,
-                    "error": "APPROVAL_ORDER_LINK_FAILED",
-                    "message": (
-                        "The order was created, but its approval "
-                        "record could not be finalised."
-                    ),
-                    "order_result": result,
-                }
+                if link_result.get("success"):
+                    mark_approval_processed(preconfirm_approval_id)
+                    self.approved_commercial_approval_id = None
+                else:
+                    self.log_activity(
+                        "approval_order_reconciliation_failed",
+                        "Order created but approval linkage failed",
+                        {
+                            "approval_id": preconfirm_approval_id,
+                            "order_id": result.get("order_id"),
+                            "link_result": link_result,
+                        },
+                    )
 
-            mark_approval_processed(preconfirm_approval_id)
-            self.approved_commercial_approval_id = None
+            except Exception as error:
+                self.log_activity(
+                    "approval_order_reconciliation_failed",
+                    "Order created but approval bookkeeping raised an exception",
+                    {
+                        "approval_id": preconfirm_approval_id,
+                        "order_id": result.get("order_id"),
+                        "error": str(error),
+                    },
+                )
 
         # Ingest verified results into Category B via trusted setters only.
         self._ingest_tool_side_effects(tool_name, result)
