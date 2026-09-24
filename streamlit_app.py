@@ -604,7 +604,7 @@ with sales_tab:
 
                         approve_commercial_clicked = (
                             approve_commercial_col.button(
-                                "✓ Approve Commercial Transaction",
+                                "✓ Approve",
                                 type="primary",
                                 use_container_width=True,
                                 key=(
@@ -616,7 +616,7 @@ with sales_tab:
 
                         reject_commercial_clicked = (
                             reject_commercial_col.button(
-                                "✗ Reject Commercial Transaction",
+                                "✗ Reject",
                                 use_container_width=True,
                                 key=(
                                     f"reject_commercial_"

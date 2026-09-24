@@ -1184,3 +1184,230 @@ def test_scrum44_combined_approval_preserves_human_counter_discount(
     # Original caller dictionary should not be silently mutated.
     assert order_input["discount_percent"] == 10.0
     assert order_input["final_total"] == 1655.0
+
+def test_scrum44_successful_preapproval_order_returns_authoritative_confirmation(
+    monkeypatch,
+):
+    """
+    SCRUM-44 regression.
+
+    A commercial approval was granted before customer confirmation.
+    The customer later confirms, and create_order succeeds.
+
+    Once the order exists, the customer-facing response must be an
+    authoritative order confirmation containing the real order ID.
+    It must NOT claim that a salesperson still needs to finalize it.
+    """
+
+    agent = _build_agent()
+
+    agent.approved_commercial_discount_percent = 8.0
+    agent.approved_commercial_approval_id = 4411
+    agent._resuming_approved_commercial_order = False
+
+    # _handle_tool stores successful create_order results here for
+    # deterministic confirmation rendering.
+    agent._order_result_this_cycle = None
+
+    order_input = {
+        "phone": TEST_PHONE,
+        "customer_id": "CUST-001",
+        "items": [
+            {
+                "sku": "ADP-120",
+                "quantity": 100,
+                "unit_price": 18.0,
+            }
+        ],
+        "product_subtotal": 1800.0,
+        "discount_percent": 10.0,
+        "delivery_fee": 35.0,
+        "final_total": 1655.0,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-25",
+    }
+
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_commercial_authority",
+        lambda sku, quantity, order_value, discount_percent: {
+            "success": True,
+            "requires_human_approval": True,
+            "reasons": [
+                "HIGH_VALUE",
+                "EXCESSIVE_DISCOUNT",
+            ],
+        },
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "get_matching_commercial_approval",
+        lambda **kwargs: {
+            "approval_id": 4411,
+            "phone": TEST_PHONE,
+            "approval_type": "COMMERCIAL_AUTHORITY",
+            "status": "APPROVED",
+            "sku": "ADP-120",
+            "requested_quantity": 100,
+            "order_value": 1800.0,
+            "requested_percent": 10.0,
+            "approved_percent": 8.0,
+            "reason": "HIGH_VALUE,EXCESSIVE_DISCOUNT",
+        },
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "create_order",
+        lambda **kwargs: {
+            "success": True,
+            "order_id": "SO-SCRUM44-4411",
+            "customer_id": "CUST-001",
+            "status": "CONFIRMED",
+            "items": kwargs["items"],
+            "product_subtotal": kwargs["product_subtotal"],
+            "discount_percent": kwargs["discount_percent"],
+            "delivery_fee": kwargs["delivery_fee"],
+            "final_total": kwargs["final_total"],
+            "delivery_area": kwargs["delivery_area"],
+            "delivery_date": kwargs["delivery_date"],
+        },
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "set_approval_order_id",
+        lambda approval_id, order_id: {
+            "success": True,
+            "approval_id": approval_id,
+            "order_id": order_id,
+        },
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "mark_approval_processed",
+        lambda approval_id: None,
+    )
+
+    agent._ingest_tool_side_effects = (
+        lambda tool_name, result: None
+    )
+    agent._end_current_transaction = lambda: None
+    agent.log_activity = lambda *args, **kwargs: None
+
+    result = agent._handle_tool(
+        "create_order",
+        order_input,
+    )
+
+    assert result["success"] is True
+
+    # Human counter-discount must still win.
+    assert result["discount_percent"] == 8.0
+    assert result["final_total"] == 1691.0
+
+    # Successful order must be captured for deterministic
+    # customer-facing confirmation.
+    assert agent._order_result_this_cycle is not None
+
+    confirmation = agent._render_order_confirmation_section()
+
+    assert "SO-SCRUM44-4411" in confirmation
+    assert "8%" in confirmation
+    assert "1,691" in confirmation
+
+    lower = confirmation.lower()
+
+    assert "sales representative" not in lower
+    assert "finalize" not in lower
+    assert "finalise" not in lower
+
+import types
+
+def test_scrum44_successful_order_overrides_stale_claude_finalization_message(
+    monkeypatch,
+):
+    """
+    SCRUM-44 AWS regression.
+
+    Once create_order has succeeded, trusted order state must override
+    contradictory Claude prose claiming that a salesperson still needs
+    to finalize the order.
+    """
+
+    agent = _build_agent()
+
+        # _build_agent() bypasses SalesAgent.__init__().
+    # Initialise the normal per-response grounding fields
+    # required by the shared finalizer.
+    agent._reset_response_grounding()
+
+    agent._order_result_this_cycle = {
+        "success": True,
+        "order_id": "SO-SCRUM44-4412",
+        "customer_id": "CUST-001",
+        "status": "CONFIRMED",
+        "items": [
+            {
+                "sku": "ADP-120",
+                "quantity": 100,
+                "unit_price": 18.0,
+            }
+        ],
+        "product_subtotal": 1800.0,
+        "discount_percent": 8.0,
+        "delivery_fee": 35.0,
+        "final_total": 1691.0,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-25",
+    }
+
+    agent._order_result_this_cycle = {
+        "success": True,
+        "order_id": "SO-SCRUM44-4412",
+        "customer_id": "CUST-001",
+        "status": "CONFIRMED",
+        "items": [
+            {
+                "sku": "ADP-120",
+                "quantity": 100,
+                "unit_price": 18.0,
+            }
+        ],
+        "product_subtotal": 1800.0,
+        "discount_percent": 8.0,
+        "delivery_fee": 35.0,
+        "final_total": 1691.0,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-25",
+    }
+
+    # Simulate the incorrect model prose observed on AWS.
+    claude_draft = [
+        types.SimpleNamespace(
+            type="text",
+            text=(
+                "Your order details are confirmed. "
+                "Your sales representative Xin Xian will be in touch "
+                "shortly to finalize this order for you."
+            ),
+        )
+    ]
+
+    finalized = agent._finalize_customer_response(
+        claude_draft
+    )
+
+    # Trusted order confirmation must win.
+    assert "SO-SCRUM44-4412" in finalized
+    assert "8%" in finalized
+    assert "1,691" in finalized
+
+    lower = finalized.lower()
+
+    assert "sales representative" not in lower
+    assert "will be in touch" not in lower
+    assert "finalize this order" not in lower
+    assert "finalise this order" not in lower

@@ -1146,6 +1146,7 @@ class SalesAgent:
         # discount rejection. None = no commercial rejection applied this
         # cycle.
         self._commercial_rejection_this_cycle = None
+        self._commercial_approval_this_cycle = None
 
     def log_activity(
         self,
@@ -1647,6 +1648,10 @@ class SalesAgent:
                 discount_result.get("ai_authority_limit_percent")
             )
             authority_result["combined_commercial_approval"] = True
+            self._commercial_approval_this_cycle = {
+                "requested_percent": requested_discount,
+                "reasons": list(authority_result.get("reasons", [])),
+            }
 
             return authority_result
 
@@ -2281,6 +2286,33 @@ class SalesAgent:
             "to proceed."
         )
 
+    def _render_commercial_approval_section(self):
+        """Customer-safe wording for a combined commercial escalation."""
+        snapshot = getattr(self, "_commercial_approval_this_cycle", None)
+        if not isinstance(snapshot, dict):
+            return ""
+
+        reasons = set(snapshot.get("reasons") or [])
+        requested = snapshot.get("requested_percent")
+
+        text = (
+            "Your order requires review by our sales team because the "
+            "proposed commercial terms are outside my approval authority."
+        )
+
+        if "EXCESSIVE_DISCOUNT" in reasons:
+            try:
+                requested = float(requested)
+                text += f" This includes your requested {requested:g}% discount."
+            except (TypeError, ValueError):
+                text += " This includes your requested discount."
+
+        return (
+            text
+            + " I've sent the transaction for review and will update you "
+            "once a decision is available."
+        )
+
     def _render_order_confirmation_section(self):
         """
         Deterministically render an AUTHORITATIVE order confirmation from the
@@ -2511,6 +2543,7 @@ class SalesAgent:
             self._render_commercial_rejection_section()
         )
         order_confirmation_section = self._render_order_confirmation_section()
+        commercial_approval_section = self._render_commercial_approval_section()
 
         if (
             catalogue_section
@@ -2518,6 +2551,7 @@ class SalesAgent:
             or rejection_section
             or commercial_rejection_section
             or order_confirmation_section
+            or commercial_approval_section
         ):
             # ORDER CONFIRMATION is an AUTHORITATIVE override: once the
             # trusted create_order tool returned success/CONFIRMED/order_id,
@@ -2549,6 +2583,8 @@ class SalesAgent:
                 sections.append(rejection_section)
             if commercial_rejection_section:
                 sections.append(commercial_rejection_section)
+            if commercial_approval_section and not order_confirmation_section:
+                sections.append(commercial_approval_section)
             sections.extend(
                 s for s in (catalogue_section, delivery_section) if s
             )
@@ -2905,6 +2941,10 @@ class SalesAgent:
             pending.get("ai_authority_limit_percent")
         )
         authority_result["combined_commercial_approval"] = True
+        self._commercial_approval_this_cycle = {
+            "requested_percent": requested_discount,
+            "reasons": list(authority_result.get("reasons", [])),
+        }
 
         self.log_activity(
             "commercial_approval_reconciled",
@@ -3141,6 +3181,23 @@ class SalesAgent:
                 "role": "user",
                 "content": tool_results
             })
+
+            # Once order creation succeeds, trusted order state is final.
+            # Do not give Claude another turn to contradict the persisted order.
+            if (
+                isinstance(getattr(self, "_order_result_this_cycle", None), dict)
+                and self._order_result_this_cycle.get("success")
+            ):
+                final_text = self._finalize_customer_response([])
+                print("\n" + "=" * 60)
+                print("AGENT FINAL RESPONSE")
+                print("=" * 60)
+                print(final_text)
+                return {
+                    "success": True,
+                    "response": final_text,
+                    "iterations": iteration,
+                }
 
         return {
             "success": False,
