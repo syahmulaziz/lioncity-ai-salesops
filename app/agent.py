@@ -892,13 +892,18 @@ def execute_tool(tool_name: str, tool_input: dict):
 
         matched_approvals = []
 
+        # SCRUM-44: commercial approval binds to the stable PRODUCT
+        # transaction value. Delivery is arranged later and must not invalidate
+        # a pre-confirmation approval merely because final_total changes.
+        commercial_order_value = tool_input["product_subtotal"]
+
         for item in tool_input["items"]:
             authority_result = evaluate_commercial_authority(
-            item["sku"],
-            item["quantity"],
-            tool_input["final_total"],
-            tool_input["discount_percent"]
-        )
+                item["sku"],
+                item["quantity"],
+                commercial_order_value,
+                tool_input["discount_percent"]
+            )
 
             if not authority_result.get("success"):
                 return authority_result
@@ -908,7 +913,7 @@ def execute_tool(tool_name: str, tool_input: dict):
                     phone=tool_input["phone"],
                     sku=item["sku"],
                     requested_quantity=item["quantity"],
-                    order_value=tool_input["final_total"],
+                    order_value=commercial_order_value,
                     discount_percent=tool_input["discount_percent"],
                 )
 
@@ -1026,6 +1031,15 @@ class SalesAgent:
         # discount from being escalated a second time during
         # final commercial-authority/order checks.
         self.approved_discount_percent = None
+
+        # SCRUM-44: discount approved as part of a combined
+        # COMMERCIAL_AUTHORITY decision. This is separate from the legacy
+        # discount-only state above and is scoped to the current transaction.
+        self.approved_commercial_discount_percent = None
+
+        # SCRUM-44: approval granted before customer confirmation. Consume it
+        # only after the customer later confirms and order persistence succeeds.
+        self.approved_commercial_approval_id = None
 
         # Commercial order waiting for human authority approval.
         #
@@ -1648,6 +1662,35 @@ class SalesAgent:
             )
 
         if tool_name == "create_order":
+            # SCRUM-44: a combined commercial approval may counter the
+            # requested discount (e.g. requested 10%, approved 8%). Enforce
+            # the trusted human-approved percentage deterministically rather
+            # than relying on Claude to remember/recalculate it.
+            commercial_discount = getattr(
+                self,
+                "approved_commercial_discount_percent",
+                None,
+            )
+
+            if commercial_discount is not None:
+                tool_input = dict(tool_input)
+                tool_input["discount_percent"] = float(
+                    commercial_discount
+                )
+
+                product_subtotal = float(
+                    tool_input["product_subtotal"]
+                )
+                delivery_fee = float(
+                    tool_input.get("delivery_fee") or 0.0
+                )
+
+                tool_input["final_total"] = (
+                    product_subtotal
+                    * (1 - float(commercial_discount) / 100.0)
+                    + delivery_fee
+                )
+
             approved_discount = getattr(
                 self,
                 "approved_discount_percent",
@@ -1686,7 +1729,7 @@ class SalesAgent:
                     authority_result = evaluate_commercial_authority(
                         item["sku"],
                         item["quantity"],
-                        tool_input["final_total"],
+                        tool_input["product_subtotal"],
                         0.0,
                     )
 
@@ -1711,7 +1754,7 @@ class SalesAgent:
                         approval_type="COMMERCIAL_AUTHORITY",
                         sku=tool_input["items"][0]["sku"],
                         requested_quantity=tool_input["items"][0]["quantity"],
-                        order_value=tool_input["final_total"],
+                        order_value=tool_input["product_subtotal"],
                         reason=",".join(
                             authority_result.get("reasons", [])
                         ),
@@ -1837,6 +1880,41 @@ class SalesAgent:
                 "Confirmed order waiting for commercial approval",
                 self.pending_commercial_order.copy(),
             )
+
+        # SCRUM-44: a commercial approval granted BEFORE customer
+        # confirmation is consumed only after the customer later confirms and
+        # the real order has been persisted successfully.
+        preconfirm_approval_id = getattr(
+            self, "approved_commercial_approval_id", None
+        )
+
+        if (
+            tool_name == "create_order"
+            and isinstance(result, dict)
+            and result.get("success")
+            and preconfirm_approval_id is not None
+            and not getattr(
+                self, "_resuming_approved_commercial_order", False
+            )
+        ):
+            link_result = set_approval_order_id(
+                approval_id=preconfirm_approval_id,
+                order_id=result.get("order_id"),
+            )
+
+            if not link_result.get("success"):
+                return {
+                    "success": False,
+                    "error": "APPROVAL_ORDER_LINK_FAILED",
+                    "message": (
+                        "The order was created, but its approval "
+                        "record could not be finalised."
+                    ),
+                    "order_result": result,
+                }
+
+            mark_approval_processed(preconfirm_approval_id)
+            self.approved_commercial_approval_id = None
 
         # Ingest verified results into Category B via trusted setters only.
         self._ingest_tool_side_effects(tool_name, result)
@@ -2330,6 +2408,8 @@ class SalesAgent:
         # completed sales transaction. Never carry it into
         # the customer's next order.
         self.approved_discount_percent = None
+        self.approved_commercial_discount_percent = None
+        self.approved_commercial_approval_id = None
 
     def _render_proceed_prompt(self):
         """
@@ -3086,6 +3166,73 @@ class SalesAgent:
         requested_percent = approval.get("requested_percent")
         reasons = approval.get("reason") or ""
 
+        # SCRUM-44: COMMERCIAL_AUTHORITY can include a discount decision.
+        # Preserve the human-approved percentage (which may be lower than the
+        # customer's request) as trusted transaction-scoped state.
+        approved_percent = approval.get("approved_percent")
+        has_discount_reason = (
+            "EXCESSIVE_DISCOUNT"
+            in {
+                reason.strip()
+                for reason in reasons.split(",")
+                if reason.strip()
+            }
+        )
+
+        if has_discount_reason:
+            try:
+                requested_value = float(requested_percent or 0.0)
+                approved_value = float(approved_percent)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": "INVALID_APPROVED_DISCOUNT",
+                    "message": (
+                        "Commercial approval is missing a valid "
+                        "approved discount percentage."
+                    ),
+                }
+
+            if approved_value < 0 or approved_value > requested_value:
+                return {
+                    "success": False,
+                    "error": "APPROVAL_EXCEEDS_REQUEST",
+                    "requested_discount_percent": requested_value,
+                    "approved_discount_percent": approved_value,
+                }
+
+            self.approved_commercial_discount_percent = (
+                approved_value
+            )
+
+            # If approval happened AFTER customer confirmation, the preserved
+            # order still contains the originally requested discount. Rewrite
+            # only the discount-dependent totals to the trusted human decision.
+            if self.pending_commercial_order is not None:
+                self.pending_commercial_order = dict(
+                    self.pending_commercial_order
+                )
+                self.pending_commercial_order[
+                    "discount_percent"
+                ] = approved_value
+
+                subtotal = float(
+                    self.pending_commercial_order[
+                        "product_subtotal"
+                    ]
+                )
+                delivery_fee = float(
+                    self.pending_commercial_order.get(
+                        "delivery_fee"
+                    ) or 0.0
+                )
+                self.pending_commercial_order[
+                    "final_total"
+                ] = (
+                    subtotal * (1 - approved_value / 100.0)
+                    + delivery_fee
+                )
+
         self.log_activity(
             "commercial_authority_approval",
             "Human approved commercial transaction",
@@ -3324,6 +3471,10 @@ class SalesAgent:
         # -------------------------------------------------
         # PRE-CONFIRMATION APPROVAL
         #
+        # Remember this trusted decision so the later customer-confirmed
+        # create_order can link/consume it only after persistence succeeds.
+        self.approved_commercial_approval_id = approval.get("approval_id")
+        #
         # There is no pending_commercial_order, therefore
         # create_order has NOT previously been blocked after
         # customer confirmation.
@@ -3341,8 +3492,13 @@ class SalesAgent:
                 "IMPORTANT: The customer has NOT yet confirmed that "
                 "they want to place the order.\n"
                 "Human approval authorises the commercial terms only; "
-                "it does NOT constitute customer acceptance.\n\n"
-                "Do NOT create an order now. "
+                "it does NOT constitute customer acceptance.\n"
+                + (
+                    f"Human-approved discount: {approved_percent}%.\n\n"
+                    if has_discount_reason
+                    else "\n"
+                )
+                + "Do NOT create an order now. "
                 "Do NOT claim that an order has been created. "
                 "Tell the customer that the commercial terms have been "
                 "approved and ask whether they would like to proceed "
@@ -3736,127 +3892,3 @@ class SalesAgent:
             "success": True,
             "response": final_text
         }
-
-def test_scrum44_pricing_first_then_discount_stays_combined(
-    monkeypatch,
-):
-    """
-    SCRUM-44 reverse-order regression.
-
-    If trusted pricing is already available BEFORE Claude checks
-    discount authority, the request must immediately become one
-    combined COMMERCIAL_AUTHORITY HITL.
-
-    No legacy DISCOUNT pending state may survive.
-    """
-
-    agent = _build_agent()
-
-    # Complete trusted snapshot already exists.
-    agent.enquiry.product_sku = "ADP-120"
-    agent.enquiry.quantity = 100
-    agent.enquiry.verified_subtotal = 1800.0
-
-    monkeypatch.setattr(
-        agent_module,
-        "check_discount_authority",
-        lambda requested_discount_percent: {
-            "success": True,
-            "requested_discount_percent":
-                requested_discount_percent,
-            "ai_authority_limit_percent": 5.0,
-            "requires_human_approval": True,
-        },
-    )
-
-    authority_calls = []
-    created_approvals = []
-
-    def fake_evaluate(
-        sku,
-        quantity,
-        order_value,
-        discount_percent,
-    ):
-        authority_calls.append({
-            "sku": sku,
-            "quantity": quantity,
-            "order_value": order_value,
-            "discount_percent": discount_percent,
-        })
-
-        return {
-            "success": True,
-            "requires_human_approval": True,
-            "reasons": [
-                "HIGH_VALUE",
-                "EXCESSIVE_DISCOUNT",
-            ],
-        }
-
-    monkeypatch.setattr(
-        agent_module,
-        "evaluate_commercial_authority",
-        fake_evaluate,
-    )
-
-    monkeypatch.setattr(
-        agent_module,
-        "get_matching_commercial_approval",
-        lambda **kwargs: None,
-    )
-
-    def fake_create_approval_request(**kwargs):
-        created_approvals.append(kwargs)
-
-        return {
-            "success": True,
-            "approval_id": 4408,
-            "already_exists": False,
-            **kwargs,
-        }
-
-    monkeypatch.setattr(
-        agent_module,
-        "create_approval_request",
-        fake_create_approval_request,
-    )
-
-    result = agent._handle_tool(
-        "check_discount_authority",
-        {
-            "requested_discount_percent": 10.0,
-        },
-    )
-
-    assert result["success"] is True
-    assert result["requires_human_approval"] is True
-    assert result["combined_commercial_approval"] is True
-
-    assert len(authority_calls) == 1
-
-    assert authority_calls[0] == {
-        "sku": "ADP-120",
-        "quantity": 100,
-        "order_value": 1800.0,
-        "discount_percent": 10.0,
-    }
-
-    assert len(created_approvals) == 1
-
-    approval = created_approvals[0]
-
-    assert (
-        approval["approval_type"]
-        == "COMMERCIAL_AUTHORITY"
-    )
-
-    assert set(
-        approval["reason"].split(",")
-    ) == {
-        "HIGH_VALUE",
-        "EXCESSIVE_DISCOUNT",
-    }
-
-    # No legacy discount state should exist.
-    assert agent.pending_approval is None

@@ -889,3 +889,298 @@ def test_scrum44_pricing_first_then_discount_stays_combined(
 
     # No legacy discount state should exist.
     assert agent.pending_approval is None
+
+def test_scrum44_preconfirmation_approval_survives_delivery_and_confirmation(
+    monkeypatch,
+):
+    """
+    SCRUM-44 AWS regression.
+
+    Commercial terms are approved BEFORE customer confirmation using the
+    product subtotal. Adding delivery later must not invalidate that approval
+    or cause a phantom second HITL.
+    """
+
+    agent = _build_agent()
+
+    agent.approved_commercial_discount_percent = 10.0
+    agent.approved_commercial_approval_id = 4409
+    agent._resuming_approved_commercial_order = False
+
+    order_input = {
+        "phone": TEST_PHONE,
+        "customer_id": "CUST-001",
+        "items": [
+            {
+                "sku": "ADP-120",
+                "quantity": 100,
+                "unit_price": 18.0,
+            }
+        ],
+        "product_subtotal": 1800.0,
+        "discount_percent": 10.0,
+        "delivery_fee": 35.0,
+        "final_total": 1655.0,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-25",
+    }
+
+    authority_calls = []
+    approval_lookups = []
+    created_orders = []
+    linked = []
+    processed = []
+
+    def fake_authority(
+        sku,
+        quantity,
+        order_value,
+        discount_percent,
+    ):
+        authority_calls.append({
+            "sku": sku,
+            "quantity": quantity,
+            "order_value": order_value,
+            "discount_percent": discount_percent,
+        })
+
+        return {
+            "success": True,
+            "requires_human_approval": True,
+            "reasons": [
+                "HIGH_VALUE",
+                "EXCESSIVE_DISCOUNT",
+            ],
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_commercial_authority",
+        fake_authority,
+    )
+
+    def fake_matching_approval(**kwargs):
+        approval_lookups.append(kwargs)
+
+        return {
+            "approval_id": 4409,
+            "phone": TEST_PHONE,
+            "approval_type": "COMMERCIAL_AUTHORITY",
+            "status": "APPROVED",
+            "sku": "ADP-120",
+            "requested_quantity": 100,
+            "order_value": 1800.0,
+            "requested_percent": 10.0,
+            "approved_percent": 10.0,
+            "reason": "HIGH_VALUE,EXCESSIVE_DISCOUNT",
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "get_matching_commercial_approval",
+        fake_matching_approval,
+    )
+
+    def fake_create_order(**kwargs):
+        created_orders.append(kwargs)
+
+        return {
+            "success": True,
+            "order_id": "SO-SCRUM44-4409",
+            "customer_id": kwargs["customer_id"],
+            "status": "CONFIRMED",
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "create_order",
+        fake_create_order,
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "set_approval_order_id",
+        lambda approval_id, order_id: (
+            linked.append((approval_id, order_id))
+            or {
+                "success": True,
+                "approval_id": approval_id,
+                "order_id": order_id,
+            }
+        ),
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "mark_approval_processed",
+        lambda approval_id: processed.append(
+            approval_id
+        ),
+    )
+
+    agent._ingest_tool_side_effects = (
+        lambda tool_name, result: None
+    )
+    agent._end_current_transaction = lambda: None
+    agent.log_activity = lambda *args, **kwargs: None
+
+    result = agent._handle_tool(
+        "create_order",
+        order_input,
+    )
+
+    assert result["success"] is True
+    assert result["order_id"] == "SO-SCRUM44-4409"
+
+    # CRITICAL:
+    # Commercial authority is evaluated against the stable
+    # product subtotal, NOT delivery-adjusted final_total.
+    assert authority_calls[0]["order_value"] == 1800.0
+
+    assert approval_lookups[0]["order_value"] == 1800.0
+
+    # Delivery still participates in the actual order total.
+    assert created_orders[0]["delivery_fee"] == 35.0
+    assert created_orders[0]["final_total"] == 1655.0
+
+    # Existing approval is consumed only after successful order creation.
+    assert linked == [
+        (4409, "SO-SCRUM44-4409")
+    ]
+    assert processed == [4409]
+
+    # No phantom second approval.
+    assert agent.pending_commercial_order is None
+
+def test_scrum44_combined_approval_preserves_human_counter_discount(
+    monkeypatch,
+):
+    """
+    SCRUM-44 regression.
+
+    Customer requests 10%, but human approves only 8% as part of a combined
+    COMMERCIAL_AUTHORITY decision.
+
+    Subsequent order creation must use the trusted 8%, never the original 10%.
+    """
+
+    agent = _build_agent()
+
+    agent.approved_commercial_discount_percent = 8.0
+    agent.approved_commercial_approval_id = 4410
+    agent._resuming_approved_commercial_order = False
+
+    order_input = {
+        "phone": TEST_PHONE,
+        "customer_id": "CUST-001",
+        "items": [
+            {
+                "sku": "ADP-120",
+                "quantity": 100,
+                "unit_price": 18.0,
+            }
+        ],
+        "product_subtotal": 1800.0,
+
+        # Claude/customer history may still carry the original request.
+        "discount_percent": 10.0,
+
+        "delivery_fee": 35.0,
+
+        # Likewise this may still reflect the old 10%.
+        "final_total": 1655.0,
+
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-25",
+    }
+
+    created_orders = []
+
+    monkeypatch.setattr(
+        agent_module,
+        "evaluate_commercial_authority",
+        lambda sku, quantity, order_value, discount_percent: {
+            "success": True,
+            "requires_human_approval": True,
+            "reasons": [
+                "HIGH_VALUE",
+                "EXCESSIVE_DISCOUNT",
+            ],
+        },
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "get_matching_commercial_approval",
+        lambda **kwargs: {
+            "approval_id": 4410,
+            "phone": TEST_PHONE,
+            "approval_type": "COMMERCIAL_AUTHORITY",
+            "status": "APPROVED",
+            "sku": "ADP-120",
+            "requested_quantity": 100,
+            "order_value": 1800.0,
+            "requested_percent": 10.0,
+            "approved_percent": 8.0,
+            "reason": "HIGH_VALUE,EXCESSIVE_DISCOUNT",
+        },
+    )
+
+    def fake_create_order(**kwargs):
+        created_orders.append(kwargs)
+
+        return {
+            "success": True,
+            "order_id": "SO-SCRUM44-4410",
+            "customer_id": kwargs["customer_id"],
+            "status": "CONFIRMED",
+        }
+
+    monkeypatch.setattr(
+        agent_module,
+        "create_order",
+        fake_create_order,
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "set_approval_order_id",
+        lambda approval_id, order_id: {
+            "success": True,
+            "approval_id": approval_id,
+            "order_id": order_id,
+        },
+    )
+
+    monkeypatch.setattr(
+        agent_module,
+        "mark_approval_processed",
+        lambda approval_id: None,
+    )
+
+    agent._ingest_tool_side_effects = (
+        lambda tool_name, result: None
+    )
+    agent._end_current_transaction = lambda: None
+    agent.log_activity = lambda *args, **kwargs: None
+
+    result = agent._handle_tool(
+        "create_order",
+        order_input,
+    )
+
+    assert result["success"] is True
+    assert len(created_orders) == 1
+
+    created = created_orders[0]
+
+    # Human decision wins over the originally requested 10%.
+    assert created["discount_percent"] == 8.0
+
+    # 1800 less 8% = 1656
+    # + S$35 delivery = S$1691.
+    assert created["final_total"] == 1691.0
+
+    # Original caller dictionary should not be silently mutated.
+    assert order_input["discount_percent"] == 10.0
+    assert order_input["final_total"] == 1655.0

@@ -555,6 +555,39 @@ with sales_tab:
                     # HAFIZAH: COMMERCIAL AUTHORITY HUMAN DECISION
                     if approval_type == "COMMERCIAL_AUTHORITY":
 
+                        requested_commercial_discount = float(
+                            request.get("requested_percent") or 0.0
+                        )
+                        has_discount_escalation = (
+                            "EXCESSIVE_DISCOUNT" in reasons
+                        )
+
+                        # SCRUM-44: preserve the existing human ability to
+                        # counter a requested discount even when discount is
+                        # combined with HIGH_VALUE/HIGH_QUANTITY in one
+                        # COMMERCIAL_AUTHORITY decision.
+                        if has_discount_escalation:
+                            approved_commercial_discount = st.number_input(
+                                "Approved Discount (%)",
+                                min_value=0.0,
+                                max_value=requested_commercial_discount,
+                                value=requested_commercial_discount,
+                                step=0.5,
+                                key=(
+                                    f"approved_commercial_discount_"
+                                    f"{request['approval_id']}"
+                                ),
+                            )
+
+                            st.caption(
+                                "You may approve the requested discount "
+                                "or counter with a lower percentage."
+                            )
+                        else:
+                            approved_commercial_discount = (
+                                requested_commercial_discount
+                            )
+
                         st.warning(
                             "This transaction exceeds one or more "
                             "configured AI commercial authority limits "
@@ -597,7 +630,7 @@ with sales_tab:
                             result = approve_request(
                                 approval_id=request["approval_id"],
                                 approved_percent=(
-                                    request.get("requested_percent") or 0
+                                    approved_commercial_discount
                                 ),
                             )
 
