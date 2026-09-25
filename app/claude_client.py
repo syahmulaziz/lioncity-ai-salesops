@@ -554,6 +554,35 @@ class GatewayMessages:
 
         gateway_payload = response.json()
 
+        print("\n" + "=" * 60)
+        print("SCRUM-37 GATEWAY RESPONSE METADATA")
+        print("=" * 60)
+
+        print(
+            "HTTP request id:",
+            response.headers.get("X-Request-ID")
+        )
+
+        print(
+            "Gateway response keys:",
+            sorted(gateway_payload.keys())
+        )
+
+        for key in (
+            "prompt_eval_count",
+            "eval_count",
+            "input_tokens",
+            "output_tokens",
+            "usage",
+        ):
+            if key in gateway_payload:
+                print(
+                    f"{key}:",
+                    gateway_payload.get(key)
+                )
+
+        print("=" * 60)
+
         return self._convert_response(
             gateway_payload
         )
