@@ -89,6 +89,32 @@ def create_order(
                     f"Insufficient inventory for SKU {item['sku']}"
                 )
 
+        # SCRUM-45:
+        # Consume exactly one unit of delivery capacity as part of the
+        # SAME database transaction as the confirmed order.
+        #
+        # Revalidate capacity here even if check_delivery() succeeded
+        # earlier, because capacity may have changed before confirmation.
+        cursor.execute("""
+            UPDATE delivery_slots
+            SET remaining_capacity = remaining_capacity - 1
+            WHERE delivery_area = ?
+            AND delivery_date = ?
+            AND remaining_capacity > 0
+        """, (
+            delivery_area,
+            delivery_date,
+        ))
+
+        if cursor.rowcount != 1:
+            raise ValueError(
+                "Delivery slot is unavailable or has no remaining capacity"
+            )
+
+        # Order, line items, inventory deduction and delivery capacity
+        # consumption must all succeed together.
+        connection.commit()
+
         # Order, line items and inventory deduction
         # must all succeed together.
         connection.commit()

@@ -2550,7 +2550,7 @@ class SalesAgent:
             lines.append(f"Order reference: {snapshot['order_id']}")
         items=snapshot.get("items") or []
         if items:
-            lines += ["", "Items:"]
+            lines += ["", "*Items*:"]
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -2568,7 +2568,7 @@ class SalesAgent:
             summary["discounted_subtotal"]=float(subtotal)-amount
         pricing=self._render_commercial_pricing_lines(summary)
         if pricing:
-            lines += ["", "Pricing:"] + [f"- {x}" for x in pricing]
+            lines += ["", "*Quote*:"] + [f"- {x}" for x in pricing]
         area=snapshot.get("delivery_area"); date=_format_customer_date(snapshot.get("delivery_date"))
         if area or date:
             lines += ["", "*Delivery*:"]
