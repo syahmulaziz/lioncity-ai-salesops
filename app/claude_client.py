@@ -1,3 +1,4 @@
+import json
 import os
 import uuid
 from types import SimpleNamespace
@@ -524,6 +525,31 @@ class GatewayMessages:
                 "num_predict": max_tokens
             }
 
+        # ========================================================
+        # SCRUM-37: LLM request observability
+        #
+        # Measure the exact gateway payload without logging its
+        # customer/business content.
+        # ========================================================
+
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        payload_bytes = len(
+            payload_json.encode("utf-8")
+        )
+
+        message_count = len(
+            payload.get("messages") or []
+        )
+
+        tool_count = len(
+            payload.get("tools") or []
+        )
+
         headers = {
             "Authorization": (
                 f"Bearer {self.api_key}"
@@ -554,32 +580,42 @@ class GatewayMessages:
 
         gateway_payload = response.json()
 
+        request_id = response.headers.get(
+            "X-Request-ID"
+        )
+
+        prompt_tokens = gateway_payload.get(
+            "prompt_eval_count"
+        )
+
+        output_tokens = gateway_payload.get(
+            "eval_count"
+        )
+
         print("\n" + "=" * 60)
-        print("SCRUM-37 GATEWAY RESPONSE METADATA")
+        print("SCRUM-37 LLM CALL")
         print("=" * 60)
+        print("request_id:", request_id)
+        print("model:", gateway_payload.get("model"))
+        print("message_count:", message_count)
+        print("tool_count:", tool_count)
+        print("payload_bytes:", payload_bytes)
+        print("prompt_tokens:", prompt_tokens)
+        print("output_tokens:", output_tokens)
 
-        print(
-            "HTTP request id:",
-            response.headers.get("X-Request-ID")
-        )
-
-        print(
-            "Gateway response keys:",
-            sorted(gateway_payload.keys())
-        )
-
-        for key in (
-            "prompt_eval_count",
-            "eval_count",
-            "input_tokens",
-            "output_tokens",
-            "usage",
+        if (
+            isinstance(prompt_tokens, int)
+            and isinstance(output_tokens, int)
         ):
-            if key in gateway_payload:
-                print(
-                    f"{key}:",
-                    gateway_payload.get(key)
-                )
+            print(
+                "total_tokens:",
+                prompt_tokens + output_tokens
+            )
+
+        print(
+            "done_reason:",
+            gateway_payload.get("done_reason")
+        )
 
         print("=" * 60)
 
