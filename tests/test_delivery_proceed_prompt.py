@@ -24,7 +24,10 @@ import pytest
 from tests._agent_harness import build_agent
 
 # A seeded AVAILABLE slot (Jurong / 2026-09-15 / fee 35.0).
-AVAIL_AREA, AVAIL_DATE, AVAIL_FEE = "Jurong", "2026-09-15", 35.0
+AVAIL_AREA = "Jurong"
+AVAIL_DATE = "2026-09-15"
+AVAIL_DISPLAY_DATE = "15-09-2026"
+AVAIL_FEE = 35.0
 # CBL-210 is seeded with 486 units in stock.
 SKU, PNAME, IN_STOCK_QTY = "CBL-210", "Industrial Cable", 100
 OVER_STOCK_QTY = 999999
@@ -50,7 +53,8 @@ def test_available_delivery_ready_prompts(monkeypatch):
     result = agent.send(f"Deliver {IN_STOCK_QTY} to {AVAIL_AREA} on {AVAIL_DATE}?")
     reply = result["response"]
     assert PROCEED in reply
-    assert AVAIL_AREA in reply and AVAIL_DATE in reply
+    assert AVAIL_AREA in reply
+    assert AVAIL_DISPLAY_DATE in reply
     assert f"S${AVAIL_FEE:,.2f}" in reply
     assert "create_order" not in tools
 

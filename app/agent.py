@@ -1040,6 +1040,7 @@ class SalesAgent:
         # SCRUM-44: approval granted before customer confirmation. Consume it
         # only after the customer later confirms and order persistence succeeds.
         self.approved_commercial_approval_id = None
+        self._priced_items = {}
 
         # Commercial order waiting for human authority approval.
         #
@@ -1147,6 +1148,7 @@ class SalesAgent:
         # cycle.
         self._commercial_rejection_this_cycle = None
         self._commercial_approval_this_cycle = None
+        self._commercial_summary_this_cycle = None
 
     def log_activity(
         self,
@@ -1834,6 +1836,25 @@ class SalesAgent:
         # TRUSTED PATH: run the existing business tool unchanged.
         result = execute_tool(tool_name, tool_input)
 
+        if tool_name == "get_customer_price" and isinstance(result, dict) and result.get("success"):
+            sku = result.get("sku")
+            q = result.get("quantity")
+            price = result.get("unit_price")
+            subtotal = result.get("subtotal")
+            if (isinstance(sku, str) and sku
+                and isinstance(q, int) and not isinstance(q, bool)
+                and isinstance(price, (int, float)) and not isinstance(price, bool)
+                and isinstance(subtotal, (int, float)) and not isinstance(subtotal, bool)):
+                if not hasattr(self, "_priced_items"):
+                    self._priced_items = {}
+                self._priced_items[sku] = {
+                    "sku": sku, "product_name": result.get("product_name"),
+                    "quantity": q, "unit_price": float(price),
+                    "line_total": float(subtotal),
+                }
+                self._commercial_summary_this_cycle = self._build_commercial_summary()
+
+
         # HUMAN-APPROVED COMMERCIAL RESUME (high-value confirmation fix).
         #
         # When apply_commercial_authority_approval() is resuming a
@@ -2014,6 +2035,61 @@ class SalesAgent:
         self._delivery_fee_verified_this_turn = verified
         return result
 
+    def _build_commercial_summary(self):
+        items = [dict(x) for x in (getattr(self, "_priced_items", {}) or {}).values()
+                 if isinstance(x, dict)]
+        subtotal = sum(float(x["line_total"]) for x in items)
+        discount = getattr(self, "approved_commercial_discount_percent", None)
+        if discount is None:
+            discount = getattr(self, "approved_discount_percent", None)
+        try:
+            discount = float(discount or 0.0)
+        except (TypeError, ValueError):
+            discount = 0.0
+        discount_amount = subtotal * discount / 100.0
+        discounted = subtotal - discount_amount
+        summary = {
+            "items": items, "product_subtotal": subtotal,
+            "discount_percent": discount, "discount_amount": discount_amount,
+            "discounted_subtotal": discounted, "delivery_fee": None,
+            "final_total": None,
+        }
+        d = getattr(self, "_delivery_result_this_cycle", None)
+        if isinstance(d, dict) and d.get("success") and d.get("available") is True and d.get("delivery_fee_verified") is True:
+            fee = d.get("delivery_fee")
+            if isinstance(fee, (int, float)) and not isinstance(fee, bool):
+                summary["delivery_fee"] = float(fee)
+                summary["final_total"] = discounted + float(fee)
+        return summary
+
+    def _commercial_summary(self):
+        s = getattr(self, "_commercial_summary_this_cycle", None)
+        if isinstance(s, dict):
+            return s
+        if getattr(self, "_priced_items", None):
+            s = self._build_commercial_summary()
+            self._commercial_summary_this_cycle = s
+            return s
+        return None
+
+    def _render_commercial_pricing_lines(self, s):
+        if not isinstance(s, dict):
+            return []
+        def money(v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+        lines=[]
+        if money(s.get("product_subtotal")):
+            lines.append(f"Product subtotal: S${s['product_subtotal']:,.2f}")
+        if money(s.get("discount_percent")) and s["discount_percent"] > 0 and money(s.get("discount_amount")):
+            lines.append(f"Discount ({s['discount_percent']:g}%): -S${s['discount_amount']:,.2f}")
+        if money(s.get("discounted_subtotal")) and (s.get("discount_percent") or 0) > 0:
+            lines.append(f"Discounted subtotal: S${s['discounted_subtotal']:,.2f}")
+        if money(s.get("delivery_fee")):
+            lines.append(f"Delivery fee: S${s['delivery_fee']:,.2f}")
+        if money(s.get("final_total")):
+            lines.append(f"Final total: S${s['final_total']:,.2f}")
+        return lines
+
     def _trusted_subtotal_line(self):
         """
         Return a canonical "product subtotal" line built ONLY from the
@@ -2021,7 +2097,8 @@ class SalesAgent:
         text. Returns "" when no valid trusted subtotal exists (never
         preserves/invents a customer- or model-authored amount).
         """
-        subtotal = self.enquiry.verified_subtotal
+        summary = self._commercial_summary()
+        subtotal = summary.get("product_subtotal") if summary is not None else self.enquiry.verified_subtotal
         is_number = isinstance(subtotal, (int, float)) and not isinstance(
             subtotal, bool
         )
@@ -2077,10 +2154,15 @@ class SalesAgent:
 
         if snapshot.get("delivery_fee_verified") is True:
             fee = snapshot.get("delivery_fee")
-            lines = [
-                f"Delivery to {location} is available.",
-                f"Verified delivery fee: S${fee:,.2f}.",
-            ]
+            summary = self._commercial_summary()
+
+            if summary is not None:
+                return "\n".join([
+                    f"Delivery to {location} is available.",
+                    *self._render_commercial_pricing_lines(summary),
+                ])
+            
+            lines = [f"Delivery to {location} is available.", f"Verified delivery fee: S${fee:,.2f}."]
             if subtotal_line:
                 lines.insert(0, subtotal_line)
             return " ".join(lines)
@@ -2339,70 +2421,37 @@ class SalesAgent:
         )
 
     def _render_order_confirmation_section(self):
-        """
-        Deterministically render an AUTHORITATIVE order confirmation from the
-        TRUSTED `_order_result_this_cycle` snapshot (a successful create_order
-        result) only - never from Claude's draft text. Returns "" when no
-        order was successfully created this response cycle.
-
-        This fixes the live bug where, after create_order returned
-        success/CONFIRMED/order_id, the model still emitted a stale
-        "your order needs approval / has been sent for review" reply.
-        Because the trusted tool result is authoritative, the finalizer
-        leads with THIS confirmation and discards the contradicting draft.
-
-        Every rendered value comes from the trusted create_order result;
-        monetary/quantity values are type-guarded and simply omitted (not
-        invented) when absent or malformed.
-        """
         snapshot = self._order_result_this_cycle
         if not isinstance(snapshot, dict) or not snapshot.get("success"):
             return ""
-
-        lines = ["Your order has been confirmed."]
-
-        order_id = snapshot.get("order_id")
-        if order_id:
-            lines.append(f"Order reference: {order_id}")
-
-        # Line items (trusted): SKU x quantity.
-        items = snapshot.get("items")
-        if isinstance(items, list):
+        lines=["Your order has been confirmed."]
+        if snapshot.get("order_id"):
+            lines.append(f"Order reference: {snapshot['order_id']}")
+        items=snapshot.get("items") or []
+        if items:
+            lines += ["", "Items:"]
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                sku = item.get("sku")
-                qty = item.get("quantity")
-                qty_ok = isinstance(qty, int) and not isinstance(qty, bool)
-                if sku and qty_ok:
-                    lines.append(f"- {sku} x {qty}")
-
-        def _money(value):
-            return (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and math.isfinite(value)
-            )
-
-        discount = snapshot.get("discount_percent")
-        if _money(discount) and discount > 0:
-            lines.append(f"Discount applied: {discount:g}%")
-
-        final_total = snapshot.get("final_total")
-        if _money(final_total):
-            lines.append(f"Order total: S${final_total:,.2f}")
-
-        area = snapshot.get("delivery_area")
-        date = snapshot.get("delivery_date")
-        display_date = _format_customer_date(date)
-
-        if area and display_date:
-            lines.append(
-                f"Delivery: {area} on {display_date}"
-            )
-        elif area:
-            lines.append(f"Delivery: {area}")
-
+                sku=item.get("sku"); q=item.get("quantity"); p=item.get("unit_price")
+                if sku and isinstance(q,int) and not isinstance(q,bool) and isinstance(p,(int,float)) and not isinstance(p,bool):
+                    lines.append(f"- {sku}: {q} x S${p:,.2f} = S${q*p:,.2f}")
+        subtotal=snapshot.get("product_subtotal")
+        discount=snapshot.get("discount_percent") or 0.0
+        summary={"product_subtotal":subtotal,"discount_percent":discount,
+                 "delivery_fee":snapshot.get("delivery_fee"),
+                 "final_total":snapshot.get("final_total")}
+        if isinstance(subtotal,(int,float)) and not isinstance(subtotal,bool):
+            amount=float(subtotal)*float(discount)/100.0
+            summary["discount_amount"]=amount
+            summary["discounted_subtotal"]=float(subtotal)-amount
+        pricing=self._render_commercial_pricing_lines(summary)
+        if pricing:
+            lines += ["", "Pricing:"] + [f"- {x}" for x in pricing]
+        area=snapshot.get("delivery_area"); date=_format_customer_date(snapshot.get("delivery_date"))
+        if area or date:
+            lines += ["", "Delivery:"]
+            lines.append(f"{area} on {date}" if area and date else str(area or date))
         return "\n".join(lines)
 
     def _inventory_ready(self):
@@ -2467,6 +2516,8 @@ class SalesAgent:
         self.approved_discount_percent = None
         self.approved_commercial_discount_percent = None
         self.approved_commercial_approval_id = None
+        self._priced_items = {}
+        self._commercial_summary_this_cycle = None
 
     def _render_proceed_prompt(self):
         """
@@ -2611,7 +2662,10 @@ class SalesAgent:
             if commercial_approval_section and not order_confirmation_section:
                 sections.append(commercial_approval_section)
             sections.extend(
-                s for s in (catalogue_section, delivery_section) if s
+                s for s in (
+                    catalogue_section,
+                    "" if order_confirmation_section else delivery_section,
+                ) if s
             )
 
             # Restore any OTHER trusted secondary-intent section that also
