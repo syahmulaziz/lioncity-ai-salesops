@@ -347,3 +347,221 @@ def test_scrum43_successive_pricing_results_build_trusted_basket(
     assert items["ADP-408"]["line_total"] == 1475.0
 
     assert summary["product_subtotal"] == 1501.0
+
+
+def test_scrum43_multi_item_summary_does_not_append_single_product_match():
+    """
+    SCRUM-43 AWS regression.
+
+    When a transaction contains multiple priced items, the final
+    customer response must not append a single-product catalogue
+    message referring only to the last resolved product.
+
+    Example bad response:
+        Product subtotal: S$150.00
+        ...
+        That matches Industrial Adapter (ADP-120) in our catalogue.
+
+    The basket summary is authoritative for this response.
+    """
+    agent = _build_agent()
+
+    agent._commercial_summary_this_cycle = {
+        "items": [
+            {
+                "sku": "CBL-210",
+                "product_name": "Industrial Cable",
+                "quantity": 5,
+                "unit_price": 12.0,
+                "line_total": 60.0,
+            },
+            {
+                "sku": "ADP-120",
+                "product_name": "Industrial Adapter",
+                "quantity": 5,
+                "unit_price": 18.0,
+                "line_total": 90.0,
+            },
+        ],
+        "product_subtotal": 150.0,
+        "discount_percent": 0.0,
+        "discount_amount": 0.0,
+        "discounted_subtotal": 150.0,
+        "delivery_fee": 30.0,
+        "final_total": 180.0,
+    }
+
+    agent._delivery_result_this_cycle = {
+        "success": True,
+        "available": True,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-26",
+        "delivery_fee": 30.0,
+        "delivery_fee_verified": True,
+    }
+
+    # Reproduce AWS: find_product resolved the second product during
+    # this same response cycle.
+    agent._specific_product_result_this_cycle = {
+        "sku": "ADP-120",
+        "product_name": "Industrial Adapter",
+    }
+
+    finalized = agent._finalize_customer_response([])
+
+    assert "S$150.00" in finalized
+    assert "S$180.00" in finalized
+
+    assert (
+        "That matches Industrial Adapter "
+        "(ADP-120) in our catalogue."
+        not in finalized
+    )
+
+def test_scrum43_ready_multi_item_order_still_prompts_to_proceed():
+    """
+    SCRUM-43 AWS regression.
+
+    A multi-item transaction with:
+      - trusted priced basket,
+      - verified available delivery,
+      - sufficient verified stock,
+      - no pending HITL
+
+    must still ask the customer whether they want to proceed.
+
+    Commercial-summary rendering must not accidentally suppress the
+    normal customer-confirmation checkpoint.
+    """
+    agent = _build_agent()
+
+    agent._commercial_summary_this_cycle = {
+        "items": [
+            {
+                "sku": "CBL-210",
+                "product_name": "Industrial Cable",
+                "quantity": 5,
+                "unit_price": 12.0,
+                "line_total": 60.0,
+            },
+            {
+                "sku": "ADP-120",
+                "product_name": "Industrial Adapter",
+                "quantity": 5,
+                "unit_price": 18.0,
+                "line_total": 90.0,
+            },
+        ],
+        "product_subtotal": 150.0,
+        "discount_percent": 0.0,
+        "discount_amount": 0.0,
+        "discounted_subtotal": 150.0,
+        "delivery_fee": 30.0,
+        "final_total": 180.0,
+    }
+
+    agent._delivery_result_this_cycle = {
+        "success": True,
+        "available": True,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-26",
+        "delivery_fee": 30.0,
+        "delivery_fee_verified": True,
+    }
+
+    # _render_proceed_prompt currently uses EnquiryState for its
+    # minimum order prerequisites.
+    agent.enquiry.product_sku = "ADP-120"
+    agent.enquiry.quantity = 5
+
+    # Give it the trusted inventory state it requires.
+    agent.enquiry.verified_inventory_sku = "ADP-120"
+    agent.enquiry.verified_inventory_quantity = 5
+    agent.enquiry.verified_inventory_can_fulfil = True
+
+    agent.pending_approval = None
+    agent.pending_commercial_order = None
+
+    finalized = agent._finalize_customer_response([])
+
+    assert "S$150.00" in finalized
+    assert "S$180.00" in finalized
+
+    assert (
+        "Would you like to proceed with the order?"
+        in finalized
+    )
+
+def test_scrum47_pending_combined_commercial_hitl_suppresses_proceed_prompt():
+    """
+    SCRUM-47 AWS regression.
+
+    If a combined COMMERCIAL_AUTHORITY approval is pending, the
+    customer must NOT simultaneously be asked to proceed.
+
+    Bad AWS behaviour:
+        "I've sent the transaction for review..."
+        ...
+        "Would you like to proceed with the order?"
+
+    Those instructions contradict each other.
+    """
+    agent = _build_agent()
+
+    agent._commercial_summary_this_cycle = {
+        "items": [
+            {
+                "sku": "TIE-100",
+                "product_name": "Heavy Duty Cable Tie",
+                "quantity": 100,
+                "unit_price": 2.0,
+                "line_total": 200.0,
+            },
+        ],
+        "product_subtotal": 200.0,
+        "discount_percent": 0.0,
+        "discount_amount": 0.0,
+        "discounted_subtotal": 200.0,
+        "delivery_fee": 30.0,
+        "final_total": 230.0,
+    }
+
+    agent._delivery_result_this_cycle = {
+        "success": True,
+        "available": True,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-26",
+        "delivery_fee": 30.0,
+        "delivery_fee_verified": True,
+    }
+
+    agent.enquiry.product_sku = "TIE-100"
+    agent.enquiry.quantity = 100
+
+    agent.enquiry.verified_inventory_sku = "TIE-100"
+    agent.enquiry.verified_inventory_quantity = 100
+    agent.enquiry.verified_inventory_can_fulfil = True
+
+    # This is the important state from the AWS case:
+    # a PRE-CONFIRMATION combined commercial HITL exists.
+    agent._commercial_approval_this_cycle = {
+        "requested_percent": 10.0,
+        "reasons": [
+            "EXCESSIVE_DISCOUNT",
+        ],
+    }
+
+    # No legacy discount pending state and no post-confirmation
+    # pending order exist in this scenario.
+    agent.pending_approval = None
+    agent.pending_commercial_order = None
+
+    finalized = agent._finalize_customer_response([])
+
+    assert "requires review" in finalized.lower()
+    assert "10%" in finalized
+
+    assert (
+        "Would you like to proceed with the order?"
+        not in finalized
+    )

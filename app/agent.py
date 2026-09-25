@@ -2548,6 +2548,19 @@ class SalesAgent:
         if getattr(self, "pending_commercial_order", None) is not None:
             return ""
 
+        # SCRUM-47: a combined pre-confirmation commercial-authority
+        # escalation is also a pending human decision for this response
+        # cycle. Do not simultaneously ask the customer to proceed.
+        if (
+            getattr(
+                self,
+                "_commercial_approval_this_cycle",
+                None,
+            )
+            is not None
+        ):
+            return ""
+
         # NOTE: an already-completed order no longer needs a separate flag
         # here. reset_after_order_completion() clears the completed
         # transaction's product / quantity / verified inventory, so the
@@ -2672,16 +2685,26 @@ class SalesAgent:
             # applies this cycle (see MULTI-INTENT SAFETY above). Order
             # matches the order tools are listed in TOOLS; none of these
             # activate unless their OWN tool actually ran this cycle.
+           
+            has_commercial_summary = (
+                self._commercial_summary() is not None
+            )
+
             secondary_sections = [
                 s
                 for s in (
                     self._render_quotation_section(),
                     self._render_faq_section(),
-                    self._render_specific_product_section(),
+                    (
+                        ""
+                        if has_commercial_summary
+                        else self._render_specific_product_section()
+                    ),
                     self._render_handoff_section(),
                 )
                 if s
             ]
+
             sections.extend(secondary_sections)
 
             # FEATURE B: append the proceed-to-order prompt LAST, and only
