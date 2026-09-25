@@ -623,3 +623,236 @@ def test_scrum43_delivery_summary_shows_all_basket_line_items():
     assert "Product subtotal: S$150.00" in rendered
     assert "Delivery fee: S$30.00" in rendered
     assert "Final total: S$180.00" in rendered
+
+def test_scrum43_multi_item_all_stock_verified_prompts_to_proceed(
+    monkeypatch,
+):
+    """
+    SCRUM-43 AWS regression.
+
+    A multi-item basket may proceed only when EVERY basket line has
+    sufficient trusted inventory verification.
+
+    Reproduces:
+      5 x CBL-210
+      5 x ADP-120
+      verified delivery
+
+    Expected:
+      customer is asked whether they want to proceed.
+    """
+    agent = _build_agent()
+
+    pricing_results = {
+        "CBL-210": {
+            "success": True,
+            "customer_id": "CUST-001",
+            "sku": "CBL-210",
+            "product_name": "Industrial Cable",
+            "quantity": 5,
+            "unit_price": 12.0,
+            "price_source": "LIST_PRICE",
+            "subtotal": 60.0,
+        },
+        "ADP-120": {
+            "success": True,
+            "customer_id": "CUST-001",
+            "sku": "ADP-120",
+            "product_name": "Industrial Adapter",
+            "quantity": 5,
+            "unit_price": 18.0,
+            "price_source": "LIST_PRICE",
+            "subtotal": 90.0,
+        },
+    }
+
+    inventory_results = {
+        "CBL-210": {
+            "success": True,
+            "sku": "CBL-210",
+            "requested_quantity": 5,
+            "can_fulfil": True,
+        },
+        "ADP-120": {
+            "success": True,
+            "sku": "ADP-120",
+            "requested_quantity": 5,
+            "can_fulfil": True,
+        },
+    }
+
+    def fake_execute_tool(tool_name, tool_input):
+        if tool_name == "get_customer_price":
+            return pricing_results[tool_input["sku"]]
+
+        if tool_name == "check_inventory":
+            return inventory_results[tool_input["sku"]]
+
+        raise AssertionError(
+            f"Unexpected tool call: {tool_name}"
+        )
+
+    monkeypatch.setattr(
+        agent_module,
+        "execute_tool",
+        fake_execute_tool,
+    )
+
+    # Build the real trusted two-item basket.
+    for sku in ("CBL-210", "ADP-120"):
+        price = pricing_results[sku]
+
+        result = agent._handle_tool(
+            "get_customer_price",
+            {
+                "customer_id": "CUST-001",
+                "sku": sku,
+                "quantity": 5,
+            },
+        )
+
+        assert result["success"] is True
+
+        result = agent._handle_tool(
+            "check_inventory",
+            {
+                "sku": sku,
+                "requested_quantity": 5,
+            },
+        )
+
+        assert result["success"] is True
+
+    agent._delivery_result_this_cycle = {
+        "success": True,
+        "available": True,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-26",
+        "delivery_fee": 30.0,
+        "delivery_fee_verified": True,
+    }
+
+    agent.pending_approval = None
+    agent.pending_commercial_order = None
+    agent._commercial_approval_this_cycle = None
+
+    finalized = agent._finalize_customer_response([])
+
+    assert "CBL-210" in finalized
+    assert "ADP-120" in finalized
+    assert "Product subtotal: S$150.00" in finalized
+
+    assert (
+        "Would you like to proceed with the order?"
+        in finalized
+    )
+
+def test_scrum43_multi_item_missing_stock_verification_suppresses_proceed(
+    monkeypatch,
+):
+    """
+    SCRUM-43 safety regression.
+
+    A multi-item basket must NOT become order-ready merely because
+    one item has sufficient verified inventory.
+
+    Every priced basket line must have matching trusted stock
+    verification before the customer is invited to proceed.
+    """
+    agent = _build_agent()
+
+    pricing_results = {
+        "CBL-210": {
+            "success": True,
+            "customer_id": "CUST-001",
+            "sku": "CBL-210",
+            "product_name": "Industrial Cable",
+            "quantity": 5,
+            "unit_price": 12.0,
+            "price_source": "LIST_PRICE",
+            "subtotal": 60.0,
+        },
+        "ADP-120": {
+            "success": True,
+            "customer_id": "CUST-001",
+            "sku": "ADP-120",
+            "product_name": "Industrial Adapter",
+            "quantity": 5,
+            "unit_price": 18.0,
+            "price_source": "LIST_PRICE",
+            "subtotal": 90.0,
+        },
+    }
+
+    def fake_execute_tool(tool_name, tool_input):
+        if tool_name == "get_customer_price":
+            return pricing_results[tool_input["sku"]]
+
+        if (
+            tool_name == "check_inventory"
+            and tool_input["sku"] == "CBL-210"
+        ):
+            return {
+                "success": True,
+                "sku": "CBL-210",
+                "requested_quantity": 5,
+                "can_fulfil": True,
+            }
+
+        raise AssertionError(
+            f"Unexpected tool call: {tool_name}"
+        )
+
+    monkeypatch.setattr(
+        agent_module,
+        "execute_tool",
+        fake_execute_tool,
+    )
+
+    # Price BOTH basket lines.
+    for sku in ("CBL-210", "ADP-120"):
+        result = agent._handle_tool(
+            "get_customer_price",
+            {
+                "customer_id": "CUST-001",
+                "sku": sku,
+                "quantity": 5,
+            },
+        )
+
+        assert result["success"] is True
+
+    # Verify stock for ONLY ONE basket line.
+    inventory_result = agent._handle_tool(
+        "check_inventory",
+        {
+            "sku": "CBL-210",
+            "requested_quantity": 5,
+        },
+    )
+
+    assert inventory_result["success"] is True
+
+    agent._delivery_result_this_cycle = {
+        "success": True,
+        "available": True,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-26",
+        "delivery_fee": 30.0,
+        "delivery_fee_verified": True,
+    }
+
+    agent.pending_approval = None
+    agent.pending_commercial_order = None
+    agent._commercial_approval_this_cycle = None
+
+    finalized = agent._finalize_customer_response([])
+
+    assert "CBL-210" in finalized
+    assert "ADP-120" in finalized
+    assert "Product subtotal: S$150.00" in finalized
+
+    assert (
+        "Would you like to proceed with the order?"
+        not in finalized
+    )

@@ -1042,6 +1042,10 @@ class SalesAgent:
         self.approved_commercial_approval_id = None
         self._priced_items = {}
 
+        # SCRUM-43: trusted inventory verification for each basket SKU.
+        # Populated only from successful check_inventory tool results.
+        self._inventory_by_sku = {}
+
         # Commercial order waiting for human authority approval.
         #
         # Unlike pending_approval (legacy discount HITL), this stores
@@ -1399,12 +1403,44 @@ class SalesAgent:
                 {"success": False, "can_fulfil": False}
             )
 
-            # PERSIST the trusted inventory verification on EnquiryState
-            # (Category B), bound to the checked SKU + requested quantity.
+            # PERSIST the trusted inventory verification on EnquiryState.
             self.enquiry.set_verified_inventory(result)
 
+            # SCRUM-43:
+            # Retain trusted inventory verification for EACH basket SKU.
+            # Multi-item order readiness requires every priced line to have
+            # matching sufficient stock verification.
+            if (
+                isinstance(result, dict)
+                and result.get("success")
+            ):
+                sku = result.get("sku")
+                requested_quantity = result.get(
+                    "requested_quantity"
+                )
+                can_fulfil = result.get("can_fulfil")
+
+                if (
+                    isinstance(sku, str)
+                    and sku
+                    and isinstance(requested_quantity, int)
+                    and not isinstance(requested_quantity, bool)
+                    and isinstance(can_fulfil, bool)
+                ):
+                    if not hasattr(self, "_inventory_by_sku"):
+                        self._inventory_by_sku = {}
+
+                    self._inventory_by_sku[sku] = {
+                        "sku": sku,
+                        "requested_quantity": requested_quantity,
+                        "can_fulfil": can_fulfil,
+                    }
+
             # Preserve existing trusted side-effect ingestion.
-            self._ingest_tool_side_effects(tool_name, result)
+            self._ingest_tool_side_effects(
+                tool_name,
+                result,
+            )
 
             return result
 
@@ -2149,7 +2185,7 @@ class SalesAgent:
         if money(s.get("delivery_fee")):
             lines.append(f"Delivery fee: S${s['delivery_fee']:,.2f}")
         if money(s.get("final_total")):
-            lines.append(f"Final total: S${s['final_total']:,.2f}")
+            lines.append(f"*Final total: S${s['final_total']:,.2f}*")
         return lines
 
     def _trusted_subtotal_line(self):
@@ -2230,7 +2266,7 @@ class SalesAgent:
                 if item_lines:
                     sections.extend([
                         "",
-                        "Items:",
+                        "*Items*:",
                         *item_lines,
                     ])
 
@@ -2241,7 +2277,7 @@ class SalesAgent:
                 if pricing_lines:
                     sections.extend([
                         "",
-                        "Pricing:",
+                        "*Quote*:",
                         *pricing_lines,
                     ])
 
@@ -2535,10 +2571,54 @@ class SalesAgent:
             lines += ["", "Pricing:"] + [f"- {x}" for x in pricing]
         area=snapshot.get("delivery_area"); date=_format_customer_date(snapshot.get("delivery_date"))
         if area or date:
-            lines += ["", "Delivery:"]
+            lines += ["", "*Delivery*:"]
             lines.append(f"{area} on {date}" if area and date else str(area or date))
         return "\n".join(lines)
 
+    def _basket_inventory_ready(self):
+        """
+        Return True only when EVERY trusted priced basket line has
+        matching sufficient trusted inventory verification.
+        """
+        priced_items = getattr(self, "_priced_items", {}) or {}
+
+        # This helper is specifically for multi-item basket readiness.
+        if len(priced_items) <= 1:
+            return False
+
+        inventory_by_sku = (
+            getattr(self, "_inventory_by_sku", {}) or {}
+        )
+
+        for sku, item in priced_items.items():
+            if not isinstance(item, dict):
+                return False
+
+            quantity = item.get("quantity")
+
+            if (
+                not isinstance(quantity, int)
+                or isinstance(quantity, bool)
+                or quantity <= 0
+            ):
+                return False
+
+            inventory = inventory_by_sku.get(sku)
+
+            if not isinstance(inventory, dict):
+                return False
+
+            if (
+                inventory.get("requested_quantity")
+                != quantity
+            ):
+                return False
+
+            if inventory.get("can_fulfil") is not True:
+                return False
+
+        return True
+    
     def _inventory_ready(self):
         """
         Trusted stock-readiness check for the delivery proceed-prompt.
@@ -2557,6 +2637,19 @@ class SalesAgent:
         stored values - never Claude's prose, never the delivery result,
         never a subtotal.
         """
+
+        # SCRUM-43: multi-item transaction readiness.
+        # Every priced basket line must have matching sufficient
+        # trusted stock verification.
+        priced_items = getattr(
+            self,
+            "_priced_items",
+            {},
+        ) or {}
+
+        if len(priced_items) > 1:
+            return self._basket_inventory_ready()
+        
         current_sku = getattr(self.enquiry, "product_sku", None)
         current_quantity = getattr(self.enquiry, "quantity", None)
         return self.enquiry.inventory_ready_for(current_sku, current_quantity)
@@ -2569,6 +2662,54 @@ class SalesAgent:
         quantity on EnquiryState. Reads ONLY trusted state (never Claude's
         prose). Used by the delivery proceed-prompt (Feature B).
         """
+
+        # SCRUM-43: a trusted multi-item priced basket is itself a valid
+        # set of order prerequisites. Do not require the legacy
+        # EnquiryState single-product SKU/quantity representation when
+        # the transaction contains multiple verified basket lines.
+        priced_items = getattr(
+            self,
+            "_priced_items",
+            {},
+        ) or {}
+
+        if len(priced_items) > 1:
+            for sku, item in priced_items.items():
+                if not isinstance(item, dict):
+                    return False
+
+                quantity = item.get("quantity")
+                unit_price = item.get("unit_price")
+                line_total = item.get("line_total")
+
+                if not isinstance(sku, str) or not sku:
+                    return False
+
+                if (
+                    not isinstance(quantity, int)
+                    or isinstance(quantity, bool)
+                    or quantity <= 0
+                ):
+                    return False
+
+                if (
+                    not isinstance(unit_price, (int, float))
+                    or isinstance(unit_price, bool)
+                    or not math.isfinite(unit_price)
+                    or unit_price < 0
+                ):
+                    return False
+
+                if (
+                    not isinstance(line_total, (int, float))
+                    or isinstance(line_total, bool)
+                    or not math.isfinite(line_total)
+                    or line_total < 0
+                ):
+                    return False
+
+            return True
+
         product_sku = getattr(self.enquiry, "product_sku", None)
         quantity = getattr(self.enquiry, "quantity", None)
         has_product = bool(product_sku)
@@ -2602,6 +2743,7 @@ class SalesAgent:
         self.approved_commercial_discount_percent = None
         self.approved_commercial_approval_id = None
         self._priced_items = {}
+        self._inventory_by_sku = {}
         self._commercial_summary_this_cycle = None
 
     def _render_proceed_prompt(self):
