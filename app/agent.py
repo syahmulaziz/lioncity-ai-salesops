@@ -2072,6 +2072,68 @@ class SalesAgent:
             return s
         return None
 
+    def _render_commercial_item_lines(self, summary):
+        """
+        Render trusted basket line items from the canonical commercial summary.
+
+        Values originate from successful get_customer_price results only.
+        """
+        if not isinstance(summary, dict):
+            return []
+
+        items = summary.get("items") or []
+        lines = []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            sku = item.get("sku")
+            product_name = item.get("product_name")
+            quantity = item.get("quantity")
+            unit_price = item.get("unit_price")
+            line_total = item.get("line_total")
+
+            valid_quantity = (
+                isinstance(quantity, int)
+                and not isinstance(quantity, bool)
+                and quantity > 0
+            )
+
+            valid_price = (
+                isinstance(unit_price, (int, float))
+                and not isinstance(unit_price, bool)
+                and math.isfinite(unit_price)
+            )
+
+            valid_total = (
+                isinstance(line_total, (int, float))
+                and not isinstance(line_total, bool)
+                and math.isfinite(line_total)
+            )
+
+            if not (
+                sku
+                and valid_quantity
+                and valid_price
+                and valid_total
+            ):
+                continue
+
+            label = (
+                f"{product_name} ({sku})"
+                if product_name
+                else str(sku)
+            )
+
+            lines.append(
+                f"- {label}: "
+                f"{quantity} x S${unit_price:,.2f} "
+                f"= S${line_total:,.2f}"
+            )
+
+        return lines
+
     def _render_commercial_pricing_lines(self, s):
         if not isinstance(s, dict):
             return []
@@ -2157,10 +2219,33 @@ class SalesAgent:
             summary = self._commercial_summary()
 
             if summary is not None:
-                return "\n".join([
-                    f"Delivery to {location} is available.",
-                    *self._render_commercial_pricing_lines(summary),
-                ])
+                item_lines = self._render_commercial_item_lines(
+                    summary
+                )
+
+                sections = [
+                    f"Delivery to {location} is available."
+                ]
+
+                if item_lines:
+                    sections.extend([
+                        "",
+                        "Items:",
+                        *item_lines,
+                    ])
+
+                pricing_lines = (
+                    self._render_commercial_pricing_lines(summary)
+                )
+
+                if pricing_lines:
+                    sections.extend([
+                        "",
+                        "Pricing:",
+                        *pricing_lines,
+                    ])
+
+                return "\n".join(sections)
             
             lines = [f"Delivery to {location} is available.", f"Verified delivery fee: S${fee:,.2f}."]
             if subtotal_line:

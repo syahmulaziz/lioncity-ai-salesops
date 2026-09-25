@@ -565,3 +565,61 @@ def test_scrum47_pending_combined_commercial_hitl_suppresses_proceed_prompt():
         "Would you like to proceed with the order?"
         not in finalized
     )
+
+def test_scrum43_delivery_summary_shows_all_basket_line_items():
+    """
+    SCRUM-43 AWS regression.
+
+    A multi-item delivery summary must show every priced basket
+    line, not merely the aggregate subtotal and not merely the
+    last product resolved by find_product.
+    """
+    agent = _build_agent()
+
+    agent._commercial_summary_this_cycle = {
+        "items": [
+            {
+                "sku": "CBL-210",
+                "product_name": "Industrial Cable",
+                "quantity": 5,
+                "unit_price": 12.0,
+                "line_total": 60.0,
+            },
+            {
+                "sku": "ADP-120",
+                "product_name": "Industrial Adapter",
+                "quantity": 5,
+                "unit_price": 18.0,
+                "line_total": 90.0,
+            },
+        ],
+        "product_subtotal": 150.0,
+        "discount_percent": 0.0,
+        "discount_amount": 0.0,
+        "discounted_subtotal": 150.0,
+        "delivery_fee": 30.0,
+        "final_total": 180.0,
+    }
+
+    agent._delivery_result_this_cycle = {
+        "success": True,
+        "available": True,
+        "delivery_area": "Tengah",
+        "delivery_date": "2026-09-26",
+        "delivery_fee": 30.0,
+        "delivery_fee_verified": True,
+    }
+
+    rendered = agent._render_delivery_section()
+
+    assert "CBL-210" in rendered
+    assert "Industrial Cable" in rendered
+    assert "5 x S$12.00 = S$60.00" in rendered
+
+    assert "ADP-120" in rendered
+    assert "Industrial Adapter" in rendered
+    assert "5 x S$18.00 = S$90.00" in rendered
+
+    assert "Product subtotal: S$150.00" in rendered
+    assert "Delivery fee: S$30.00" in rendered
+    assert "Final total: S$180.00" in rendered
